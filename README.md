@@ -21,6 +21,6 @@ Currently we just JIT the provided binary file into a function and then call it 
 ## Usage
 
 ```
-cargo run <target bin> [-vvvv] [-a ARCH]```
-
+cargo run <target bin> [-vvvv] [-a ARCH]
+```
 
