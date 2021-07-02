@@ -101,6 +101,7 @@ impl<'ctx> CodeGen<'ctx> {
     ) {
         match node.space.as_str() {
             "register" => {
+                assert!((node.offset + node.size as usize) < REGS_SIZE);
                 let load_reg_store = func.get_first_param().unwrap().into_pointer_value();
                 let reg_store = self.builder.build_load(load_reg_store, "regs");
                 let reg_address = unsafe {
