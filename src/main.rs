@@ -24,6 +24,10 @@ struct Emu {
     pub regs: *mut u8,
 }
 
+extern "C" fn call_print() {
+    println!("testing1234");
+}
+
 type EmuFunc = unsafe extern "C" fn(*mut Emu);
 
 struct CodeGen<'ctx> {
@@ -31,6 +35,28 @@ struct CodeGen<'ctx> {
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     execution_engine: ExecutionEngine<'ctx>,
+}
+
+struct FuncContext<'ctx> {
+    func: FunctionValue<'ctx>,
+    uniques: BTreeMap<usize, BasicValueEnum<'ctx>>,
+    emu_ptr: BasicValueEnum<'ctx>,
+    regs_ptr: BasicValueEnum<'ctx>,
+}
+
+impl<'ctx> FuncContext<'ctx> {
+    fn new(
+        fn_val: FunctionValue<'ctx>,
+        emu_ptr: BasicValueEnum<'ctx>,
+        regs_ptr: BasicValueEnum<'ctx>,
+    ) -> Self {
+        Self {
+            func: fn_val,
+            uniques: BTreeMap::<usize, BasicValueEnum<'ctx>>::new(),
+            emu_ptr: emu_ptr,
+            regs_ptr: regs_ptr,
+        }
+    }
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -59,19 +85,16 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn varnode_read_value(
         &self,
-        func: &FunctionValue<'ctx>,
-        uniques: &BTreeMap<usize, BasicValueEnum<'ctx>>,
+        fctx: &FuncContext<'ctx>,
         node: &PcodeVarnodeData,
     ) -> BasicValueEnum<'ctx> {
         match node.space.as_str() {
             "register" => {
                 assert!((node.offset + node.size as usize) < REGS_SIZE);
-                let load_reg_store = func.get_first_param().unwrap().into_pointer_value();
-                let reg_store = self.builder.build_load(load_reg_store, "regs");
                 let reg_type = self.int_type_from_length(node.size);
                 let reg_address = unsafe {
                     self.builder.build_gep(
-                        reg_store.into_pointer_value(),
+                        fctx.regs_ptr.into_pointer_value(),
                         &[self.context.i64_type().const_int(node.offset as u64, false)],
                         "reg_address",
                     )
@@ -83,7 +106,7 @@ impl<'ctx> CodeGen<'ctx> {
                 );
                 self.builder.build_load(ra, "reg_val")
             }
-            "unique" => uniques[&node.offset],
+            "unique" => fctx.uniques[&node.offset],
             "const" => {
                 let t = self.int_type_from_length(node.size);
                 BasicValueEnum::IntValue(t.const_int(node.offset as u64, false))
@@ -94,19 +117,16 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn varnode_write_value(
         &self,
-        func: &FunctionValue<'ctx>,
-        uniques: &mut BTreeMap<usize, BasicValueEnum<'ctx>>,
+        fctx: &mut FuncContext<'ctx>,
         node: &PcodeVarnodeData,
         val: BasicValueEnum<'ctx>,
     ) {
         match node.space.as_str() {
             "register" => {
                 assert!((node.offset + node.size as usize) < REGS_SIZE);
-                let load_reg_store = func.get_first_param().unwrap().into_pointer_value();
-                let reg_store = self.builder.build_load(load_reg_store, "regs");
                 let reg_address = unsafe {
                     self.builder.build_gep(
-                        reg_store.into_pointer_value(),
+                        fctx.regs_ptr.into_pointer_value(),
                         &[self.context.i64_type().const_int(node.offset as u64, false)],
                         "reg_address",
                     )
@@ -114,7 +134,7 @@ impl<'ctx> CodeGen<'ctx> {
                 self.builder.build_store(reg_address, val);
             }
             "unique" => {
-                uniques.insert(node.offset, val);
+                fctx.uniques.insert(node.offset, val);
             }
             _ => panic!("Unhandled space \"{}\"", node.space),
         }
@@ -123,7 +143,7 @@ impl<'ctx> CodeGen<'ctx> {
     fn jit_compile_pcode(
         &self,
         addr: u64,
-        pcode_ops: &Vec<PcodeInstruction>,
+        pcode_ops: &[PcodeInstruction],
     ) -> Option<JitFunction<EmuFunc>> {
         // Create our function for this block of pcode
         let fn_type = self.context.void_type().fn_type(
@@ -135,17 +155,119 @@ impl<'ctx> CodeGen<'ctx> {
                 .into()],
             false,
         );
+
         let fn_name = format!("func_{:016x}", addr);
         let fn_val = self.module.add_function(&fn_name, fn_type, None);
+        let entry_bb = self.context.append_basic_block(fn_val, "entry");
+        self.builder.position_at_end(entry_bb);
 
-        // Create the entry basic block and place the builder at the end (start) of it
-        let fn_entry = self.context.append_basic_block(fn_val, "entry");
-        self.builder.position_at_end(fn_entry);
-        let mut unique_map = BTreeMap::<usize, BasicValueEnum<'ctx>>::new();
+        let emu_ptr = fn_val.get_first_param().unwrap().into_pointer_value();
+        let regs_ptr = self.builder.build_load(emu_ptr, "regs");
+        let mut fn_ctx = FuncContext::new(
+            fn_val,
+            BasicValueEnum::PointerValue(emu_ptr),
+            regs_ptr,
+        );
 
+        // Create a list of basic blocks correlating to each pcode inst in the slice
+        //  to allow for easier branching (internal branching)
+        let mut ops_bb = Vec::new();
         for op in pcode_ops {
+            let bb = self.context.append_basic_block(fn_val, "op");
+            ops_bb.push((op, bb));
+        }
+        let ret_block = self.context.append_basic_block(fn_val, "return");
+        
+        // Make sure the entry basic block goes to the next block
+        let entry_next_bb = entry_bb.get_next_basic_block();
+        if let Some(nbb) = entry_next_bb {
+            self.builder.build_unconditional_branch(nbb);
+        }
+
+        let mut i = 0;
+        for (op, bb) in &ops_bb {
+            self.builder.position_at_end(*bb);
             debug!("{:?}", op);
             match op.opcode {
+                PcodeOpCode::BRANCH | PcodeOpCode::CALL => {
+                    // Raw pcode should always have exactly one input for this
+                    assert_eq!(op.vars.len(), 1);
+                    assert!(op.out_var.is_none());
+                    let inp0 = &op.vars[0];
+                    match inp0.space.as_str() {
+                        "const" => {
+                            debug!("Hit internal branch code!");
+                            let index = inp0.offset.wrapping_add(i);
+                            debug!("Branching internally to pcode inst at {}", index);
+                            let (_, target_bb) = ops_bb[index];
+                            self.builder.build_unconditional_branch(target_bb);
+                        }
+                        "ram" => {
+                            debug!("Hit external branching code!");
+                            let mut found = false;
+                            for (t_op, t_bb) in &ops_bb {
+                                if t_op.addr.offset == inp0.offset as u64 {
+                                    debug!(
+                                        "Branching to instruction {:?} @ 0x{:x}",
+                                        t_op.opcode, t_op.addr.offset
+                                    );
+                                    self.builder.build_unconditional_branch(*t_bb);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                panic!("Unimplemented branching outside of known space");
+                            }
+                        }
+                        _ => panic!("Unimplemented branch for space \"{}\"", inp0.space),
+                    }
+                }
+                PcodeOpCode::CBRANCH => {
+                    // Raw pcode should always have exactly one input for this
+                    assert_eq!(op.vars.len(), 2);
+                    assert!(op.out_var.is_none());
+                    let inp0 = &op.vars[0];
+                    let inp1 = self
+                        .varnode_read_value(&fn_ctx, &op.vars[1])
+                        .into_int_value();
+                    match inp0.space.as_str() {
+                        "const" => {
+                            debug!("Hit internal branch code!");
+                            let index = inp0.offset.wrapping_add(i);
+                            debug!("Branching internally to pcode inst at {}", index);
+                            let (_, target_bb) = ops_bb[index];
+                            self.builder.build_conditional_branch(
+                                inp1,
+                                target_bb,
+                                bb.get_next_basic_block().unwrap(),
+                            );
+                        }
+                        "ram" => {
+                            debug!("Hit external branching code!");
+                            let mut found = false;
+                            for (t_op, t_bb) in &ops_bb {
+                                if t_op.addr.offset == inp0.offset as u64 {
+                                    debug!(
+                                        "Branching to instruction {:?} @ 0x{:x}",
+                                        t_op.opcode, t_op.addr.offset
+                                    );
+                                    self.builder.build_conditional_branch(
+                                        inp1,
+                                        *t_bb,
+                                        bb.get_next_basic_block().unwrap(),
+                                    );
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                panic!("Unimplemented branching outside of known space");
+                            }
+                        }
+                        _ => panic!("Unimplemented cbranch for space \"{}\"", inp0.space),
+                    }
+                }
                 PcodeOpCode::COPY => {
                     assert_eq!(op.vars.len(), 1);
                     let outvar = match &op.out_var {
@@ -153,8 +275,8 @@ impl<'ctx> CodeGen<'ctx> {
                         None => panic!("out_var for {:?} must not be None!", op.opcode),
                     };
                     assert_eq!(outvar.size, op.vars[0].size);
-                    let inp0 = self.varnode_read_value(&fn_val, &unique_map, &op.vars[0]);
-                    self.varnode_write_value(&fn_val, &mut unique_map, outvar, inp0);
+                    let inp0 = self.varnode_read_value(&fn_ctx, &op.vars[0]);
+                    self.varnode_write_value(&mut fn_ctx, outvar, inp0);
                 }
                 /*
                  * INT_SBORROW | INT_SCARRY
@@ -173,10 +295,10 @@ impl<'ctx> CodeGen<'ctx> {
                     assert_eq!(op.vars[0].size, op.vars[1].size);
 
                     let inp0 = self
-                        .varnode_read_value(&fn_val, &unique_map, &op.vars[0])
+                        .varnode_read_value(&fn_ctx, &op.vars[0])
                         .into_int_value();
                     let inp1 = self
-                        .varnode_read_value(&fn_val, &unique_map, &op.vars[1])
+                        .varnode_read_value(&fn_ctx, &op.vars[1])
                         .into_int_value();
                     let cres = match op.opcode {
                         PcodeOpCode::INT_SBORROW => {
@@ -209,8 +331,7 @@ impl<'ctx> CodeGen<'ctx> {
                     };
 
                     self.varnode_write_value(
-                        &fn_val,
-                        &mut unique_map,
+                        &mut fn_ctx,
                         outvar,
                         BasicValueEnum::IntValue(res),
                     );
@@ -225,10 +346,10 @@ impl<'ctx> CodeGen<'ctx> {
                     assert_eq!(op.vars[0].size, op.vars[1].size);
 
                     let inp0 = self
-                        .varnode_read_value(&fn_val, &unique_map, &op.vars[0])
+                        .varnode_read_value(&fn_ctx, &op.vars[0])
                         .into_int_value();
                     let inp1 = self
-                        .varnode_read_value(&fn_val, &unique_map, &op.vars[1])
+                        .varnode_read_value(&fn_ctx, &op.vars[1])
                         .into_int_value();
 
                     let add = self.builder.build_int_add(inp0, inp1, "sum_val");
@@ -259,8 +380,7 @@ impl<'ctx> CodeGen<'ctx> {
                         "res",
                     );
                     self.varnode_write_value(
-                        &fn_val,
-                        &mut unique_map,
+                        &mut fn_ctx,
                         outvar,
                         BasicValueEnum::IntValue(res),
                     );
@@ -293,10 +413,10 @@ impl<'ctx> CodeGen<'ctx> {
                     assert_eq!(op.vars[0].size, op.vars[1].size);
                     assert_eq!(op.vars[0].size, outvar.size);
                     let inp0 = self
-                        .varnode_read_value(&fn_val, &unique_map, &op.vars[0])
+                        .varnode_read_value(&fn_ctx, &op.vars[0])
                         .into_int_value();
                     let inp1 = self
-                        .varnode_read_value(&fn_val, &unique_map, &op.vars[1])
+                        .varnode_read_value(&fn_ctx, &op.vars[1])
                         .into_int_value();
                     let res = match op.opcode {
                         PcodeOpCode::INT_ADD => self.builder.build_int_add(inp0, inp1, "res_val"),
@@ -331,8 +451,54 @@ impl<'ctx> CodeGen<'ctx> {
                         _ => panic!("Unreachable!"),
                     };
                     self.varnode_write_value(
-                        &fn_val,
-                        &mut unique_map,
+                        &mut fn_ctx,
+                        outvar,
+                        BasicValueEnum::IntValue(res),
+                    );
+                }
+                PcodeOpCode::INT_ZEXT | PcodeOpCode::INT_SEXT => {
+                    assert_eq!(op.vars.len(), 1);
+                    let outvar = match &op.out_var {
+                        Some(o) => o,
+                        None => panic!("out_var for {:?} must not be None!", op.opcode),
+                    };
+                    assert!(op.vars[0].size <= outvar.size);
+                    let inp0 = self
+                        .varnode_read_value(&fn_ctx, &op.vars[0])
+                        .into_int_value();
+                    let out_type = self.int_type_from_length(outvar.size);
+                    let res = match op.opcode {
+                        PcodeOpCode::INT_ZEXT => {
+                            self.builder.build_int_z_extend(inp0, out_type, "zext")
+                        }
+                        PcodeOpCode::INT_SEXT => {
+                            self.builder.build_int_s_extend(inp0, out_type, "sext")
+                        }
+                        _ => panic!("Unreachable!"),
+                    };
+                    self.varnode_write_value(
+                        &mut fn_ctx,
+                        outvar,
+                        BasicValueEnum::IntValue(res),
+                    );
+                }
+                PcodeOpCode::INT_2COMP | PcodeOpCode::INT_NEGATE => {
+                    assert_eq!(op.vars.len(), 1);
+                    let outvar = match &op.out_var {
+                        Some(o) => o,
+                        None => panic!("out_var for {:?} must not be None!", op.opcode),
+                    };
+                    assert_eq!(op.vars[0].size, outvar.size);
+                    let inp0 = self
+                        .varnode_read_value(&fn_ctx, &op.vars[0])
+                        .into_int_value();
+                    let res = match op.opcode {
+                        PcodeOpCode::INT_2COMP => self.builder.build_int_neg(inp0, "neg"),
+                        PcodeOpCode::INT_NEGATE => self.builder.build_not(inp0, "not"),
+                        _ => panic!("Unreachable!"),
+                    };
+                    self.varnode_write_value(
+                        &mut fn_ctx,
                         outvar,
                         BasicValueEnum::IntValue(res),
                     );
@@ -358,10 +524,10 @@ impl<'ctx> CodeGen<'ctx> {
                     assert_eq!(op.vars[0].size, op.vars[1].size);
                     assert_eq!(outvar.size, 1);
                     let inp0 = self
-                        .varnode_read_value(&fn_val, &unique_map, &op.vars[0])
+                        .varnode_read_value(&fn_ctx, &op.vars[0])
                         .into_int_value();
                     let inp1 = self
-                        .varnode_read_value(&fn_val, &unique_map, &op.vars[1])
+                        .varnode_read_value(&fn_ctx, &op.vars[1])
                         .into_int_value();
                     let cmp_res = self.builder.build_int_compare(
                         match op.opcode {
@@ -384,8 +550,7 @@ impl<'ctx> CodeGen<'ctx> {
                         "res",
                     );
                     self.varnode_write_value(
-                        &fn_val,
-                        &mut unique_map,
+                        &mut fn_ctx,
                         outvar,
                         BasicValueEnum::IntValue(res),
                     );
@@ -408,7 +573,7 @@ impl<'ctx> CodeGen<'ctx> {
                         None => panic!("out_var for {:?} must not be None!", op.opcode),
                     };
                     let inp0 = self
-                        .varnode_read_value(&fn_val, &unique_map, &op.vars[0])
+                        .varnode_read_value(&fn_ctx, &op.vars[0])
                         .into_int_value();
                     let t = inp0.get_type();
                     let t2 = self.int_type_from_length(outvar.size);
@@ -453,8 +618,7 @@ impl<'ctx> CodeGen<'ctx> {
                         "res",
                     );
                     self.varnode_write_value(
-                        &fn_val,
-                        &mut unique_map,
+                        &mut fn_ctx,
                         outvar,
                         BasicValueEnum::IntValue(res),
                     );
@@ -464,19 +628,31 @@ impl<'ctx> CodeGen<'ctx> {
                     panic!("No handler for opcode {:?}", op.opcode);
                 }
             }
+
+            match op.opcode {
+                PcodeOpCode::BRANCH | PcodeOpCode::CALL | PcodeOpCode::CBRANCH => {}
+                _ => {
+                    let next_bb = bb.get_next_basic_block();
+                    if let Some(nbb) = next_bb {
+                        self.builder.build_unconditional_branch(nbb);
+                    }
+                }
+            }
+            i += 1;
         }
 
+        self.builder.position_at_end(ret_block);
         self.builder.build_return(None);
-
+        trace!("{:?}", fn_val);
         unsafe { self.execution_engine.get_function(&fn_name).ok() }
     }
 }
 
 fn process_pcode(pcode_ops: &Vec<PcodeInstruction>) {
     let context = Context::create();
-    let module = context.create_module("sum");
+    let module = context.create_module("testing");
     let execution_engine = module
-        .create_jit_execution_engine(OptimizationLevel::Aggressive)
+        .create_jit_execution_engine(OptimizationLevel::None)
         .unwrap();
     let codegen = CodeGen {
         context: &context,
@@ -490,9 +666,9 @@ fn process_pcode(pcode_ops: &Vec<PcodeInstruction>) {
         regs: emu_regs.as_mut_ptr(),
     };
     let res_func = codegen.jit_compile_pcode(0, pcode_ops).unwrap();
-
     let start = Instant::now();
     for i in 0..10000 {
+        emu_regs = [0; 1024];
         unsafe {
             res_func.call(&mut emu as *mut Emu);
         }
