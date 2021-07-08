@@ -6,6 +6,19 @@ PCFE is an attempt at creating a JIT'd Pcode emulation engine for fuzzing purpos
 
 Currently we just JIT the provided binary file into a function and then call it 10000x to determine how fast we are.
 
+## Todo List
+
+* Update instruction pointer
+* Add RAM access
+  * May need to modify Sleighcraft for this
+* Fix the weird bug with branching + optimizations
+* Breakpoints
+* Coverage callbacks
+* Emulator API
+  * Python bindings for ease of use
+  * Loading snapshots
+    * Also may require Sleighcraft modifications
+
 ## Planned features
 
 * Branch coverage

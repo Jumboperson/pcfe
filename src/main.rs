@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::time::Instant;
+use std::convert::TryFrom;
 
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -15,7 +16,7 @@ use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
 use inkwell::types::IntType;
-use inkwell::values::{BasicValueEnum, FunctionValue, IntValue};
+use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, CallableValue};
 use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
 
 const REGS_SIZE: usize = 0x400;
@@ -24,8 +25,9 @@ struct Emu {
     pub regs: *mut u8,
 }
 
-extern "C" fn call_print() {
-    println!("testing1234");
+extern "C" fn call_print() -> bool {
+    println!("fasdf");
+    true
 }
 
 type EmuFunc = unsafe extern "C" fn(*mut Emu);
@@ -173,10 +175,10 @@ impl<'ctx> CodeGen<'ctx> {
         //  to allow for easier branching (internal branching)
         let mut ops_bb = Vec::new();
         for op in pcode_ops {
-            let bb = self.context.append_basic_block(fn_val, "op");
+            let bb = self.context.append_basic_block(fn_ctx.func, "op");
             ops_bb.push((op, bb));
         }
-        let ret_block = self.context.append_basic_block(fn_val, "return");
+        let ret_block = self.context.append_basic_block(fn_ctx.func, "return");
         
         // Make sure the entry basic block goes to the next block
         let entry_next_bb = entry_bb.get_next_basic_block();
@@ -277,6 +279,16 @@ impl<'ctx> CodeGen<'ctx> {
                     assert_eq!(outvar.size, op.vars[0].size);
                     let inp0 = self.varnode_read_value(&fn_ctx, &op.vars[0]);
                     self.varnode_write_value(&mut fn_ctx, outvar, inp0);
+                    let func_ptr: extern fn() -> bool = call_print;
+                    let static_func = func_ptr as u64;
+                    let ptr_type = self.context.bool_type().fn_type(&[], false).ptr_type(AddressSpace::Generic);
+                    let ptr = self.builder.build_int_to_ptr(
+                        self.context.i64_type().const_int(static_func, false),
+                        ptr_type,
+                        "call_func"
+                    );
+                    debug!("Putting call to {:x}", static_func);
+                    self.builder.build_call(CallableValue::try_from(ptr).unwrap(), &[], "call_val");
                 }
                 /*
                  * INT_SBORROW | INT_SCARRY
@@ -643,7 +655,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         self.builder.position_at_end(ret_block);
         self.builder.build_return(None);
-        trace!("{:?}", fn_val);
+        trace!("{:?}", fn_ctx.func);
         unsafe { self.execution_engine.get_function(&fn_name).ok() }
     }
 }
