@@ -810,7 +810,7 @@ fn main() {
     let mut sleigh = sleigh_builder.try_build().unwrap();
 
     debug!("Decoding...");
-    sleigh.decode(0).unwrap();
+    sleigh.decode(0, None).unwrap();
 
     debug!("{:?}", asm_emit.asms);
 
