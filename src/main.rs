@@ -738,11 +738,14 @@ impl<'ctx> Emulator<'ctx> {
             let e = m.address + m.memory.len() as u64;
             if address < e && address >= m.address && ne < e && ne >= m.address {
                 let o = (address - m.address) as usize;
-                m.memory[o..o+dat.len()].copy_from_slice(dat);
+                m.memory[o..o + dat.len()].copy_from_slice(dat);
                 return Ok(dat.len());
             }
         }
-        Err(format!("No mapping matches the range 0x{:x}-0x{:x}", address, ne)) 
+        Err(format!(
+            "No mapping matches the range 0x{:x}-0x{:x}",
+            address, ne
+        ))
     }
 
     pub fn mem_read(&self, address: u64, output: &mut [u8]) -> Result<usize, String> {
@@ -751,53 +754,34 @@ impl<'ctx> Emulator<'ctx> {
             let e = m.address + m.memory.len() as u64;
             if address < e && address >= m.address && ne < e && ne >= m.address {
                 let o = (address - m.address) as usize;
-                output.copy_from_slice(&m.memory[o..o+output.len()]);
+                output.copy_from_slice(&m.memory[o..o + output.len()]);
                 return Ok(output.len());
             }
         }
-        Err(format!("No mapping matches the range 0x{:x}-0x{:x}", address, ne)) 
+        Err(format!(
+            "No mapping matches the range 0x{:x}-0x{:x}",
+            address, ne
+        ))
     }
 
-    pub fn reg_read(&mut self, name: &str) -> Result<Vec::<u8>, String> {
+    pub fn reg_read(&mut self, name: &str) -> Result<Vec<u8>, String> {
         let reg = match self.sleigh.get_register(name) {
             Ok(x) => x,
             Err(_) => return Err(format!("\"{}\" is not a valid register name", name)),
         };
         Ok(self.regs[reg.offset..reg.offset + reg.size as usize].to_vec())
     }
-}
 
-fn process_pcode(pcode_ops: &Vec<PcodeInstruction>) {
-    let context = Context::create();
-    let module = context.create_module("testing");
-    let execution_engine = module
-        .create_jit_execution_engine(OptimizationLevel::None)
-        .unwrap();
-    let codegen = CodeGen {
-        context: &context,
-        module,
-        builder: context.create_builder(),
-        execution_engine,
-    };
+    pub fn reg_write(&mut self, name: &str, dat: &[u8]) -> Result<(), String> {
+        let reg = match self.sleigh.get_register(name) {
+            Ok(x) => x,
+            Err(_) => return Err(format!("\"{}\" is not a valid register name", name)),
+        };
+        self.regs[reg.offset..reg.offset + std::cmp::min(reg.size as usize, dat.len())]
+            .copy_from_slice(dat);
 
-    let mut emu_regs: [u8; 1024] = [0; 1024];
-    let mut emu = Emu {
-        regs: emu_regs.as_mut_ptr(),
-        emulator: 0 as *mut usize,
-    };
-    let res_func = codegen.jit_compile_pcode(0, pcode_ops).unwrap();
-    let start = Instant::now();
-    for i in 0..10000 {
-        emu_regs = [0; 1024];
-        unsafe {
-            res_func.call(&mut emu as *mut Emu);
-        }
+        Ok(())
     }
-    let elapsed = start.elapsed();
-    debug!("regs: {:?}", emu_regs);
-    debug!("Runtime: {:?}", elapsed);
-    debug!("Time per run {}", elapsed.as_secs_f64() / 10000 as f64);
-    debug!("Insts/sec {}", 10000 as f64 / elapsed.as_secs_f64());
 }
 
 fn read_a_file(fname: &str) -> std::io::Result<Vec<u8>> {
@@ -922,9 +906,41 @@ fn main() {
     sleigh.decode(ldecoded as u64, Some(1)).unwrap();
 
     let reg = sleigh.get_register("RCX");
-    debug!("{:?}", reg);
+    debug!("RCX: {:?}", reg);
 
     debug!("{:?}", asm_emit.asms);
 
-    process_pcode(&pcode_emit.pcode_asms);
+    let pcode_ops = &pcode_emit.pcode_asms;
+    let context = Context::create();
+    let module = context.create_module("testing");
+    let execution_engine = module
+        .create_jit_execution_engine(OptimizationLevel::None)
+        .unwrap();
+    let codegen = CodeGen {
+        context: &context,
+        module,
+        builder: context.create_builder(),
+        execution_engine,
+    };
+
+    //let emulator = Emulator::new(&codegen, &mut sleigh);
+
+    let mut emu_regs: [u8; 1024] = [0; 1024];
+    let mut emu = Emu {
+        regs: emu_regs.as_mut_ptr(),
+        emulator: 0 as *mut usize,
+    };
+    let res_func = codegen.jit_compile_pcode(0, pcode_ops).unwrap();
+    let start = Instant::now();
+    for _ in 0..10000 {
+        emu_regs = [0; 1024];
+        unsafe {
+            res_func.call(&mut emu as *mut Emu);
+        }
+    }
+    let elapsed = start.elapsed();
+    debug!("regs: {:?}", emu_regs);
+    debug!("Runtime: {:?}", elapsed);
+    debug!("Time per run {}", elapsed.as_secs_f64() / 10000 as f64);
+    debug!("Insts/sec {}", 10000 as f64 / elapsed.as_secs_f64());
 }
