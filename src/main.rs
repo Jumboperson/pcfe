@@ -45,14 +45,6 @@ struct Mapping {
     prot: Vec<Prot>,
 }
 
-struct Emulator<'ctx> {
-    regs: [u8; REGS_SIZE],
-    mappings: Vec<Mapping>,
-    codegen: &'ctx CodeGen<'ctx>,
-    sleigh: &'ctx mut Sleigh<'ctx>,
-    emu_obj: Emu,
-}
-
 #[repr(C)]
 struct Emu {
     pub regs: *mut u8,
@@ -674,8 +666,29 @@ impl<'ctx> CodeGen<'ctx> {
     }
 }
 
+struct Emulator<'ctx> {
+    regs: [u8; REGS_SIZE],
+    mappings: Vec<Mapping>,
+    context: Context,
+    //codegen: Option<CodeGen<'ctx>>,
+    sleigh: Option<Sleigh<'ctx>>,
+    pcode_emit: CollectingPcodeEmit,
+    asm_emit: CollectingAssemblyEmit,
+    emu_obj: Emu,
+}
+
+impl<'ctx> LoadImage for Emulator<'ctx> {
+    fn load_fill(&mut self, ptr: &mut [u8], addr: &Address) {
+        self.mem_read(addr.offset, ptr);
+    }
+
+    fn buf_size(&mut self) -> usize {
+        self.mappings.iter().map(|m| m.memory.len()).sum()
+    }
+}
+
 impl<'ctx> Emulator<'ctx> {
-    pub fn new(codegen: &'ctx CodeGen<'ctx>, sleigh: &'ctx mut Sleigh<'ctx>) -> Self {
+    pub fn new(/* codegen: &'ctx CodeGen<'ctx> */) -> Self {
         Self {
             regs: [0; REGS_SIZE],
             mappings: Vec::new(),
@@ -683,9 +696,32 @@ impl<'ctx> Emulator<'ctx> {
                 regs: 0 as *mut u8,
                 emulator: 0 as *mut usize,
             },
-            codegen: codegen,
-            sleigh: sleigh,
+            context: Context::create(),
+            //codegen: None,
+            sleigh: None,
+            pcode_emit: CollectingPcodeEmit::default(),
+            asm_emit: CollectingAssemblyEmit::default(),
         }
+    }
+
+    pub fn init_sleigh(&mut self, spec: &str, mode: Mode) {
+        // This chaos is us valiantly fighting the borrow checker so we can pass
+        //  mutable references to our own data tied to our own lifetime.
+        // This could should actually be safe, just is kinda stupid
+        let s = self as *mut _ as usize;
+        let self_ = s as *mut Emulator<'ctx>;
+
+            
+        let mut sleigh_builder = SleighBuilder::default();
+        sleigh_builder.spec(spec);
+        sleigh_builder.mode(mode);
+        let mirror = unsafe { &mut *self_ };
+        sleigh_builder.loader(mirror);
+        let mirror = unsafe { &mut *self_ };
+        sleigh_builder.asm_emit(&mut mirror.asm_emit);
+        sleigh_builder.pcode_emit(&mut mirror.pcode_emit);
+
+        self.sleigh = Some(sleigh_builder.try_build().unwrap());
     }
 
     pub fn mem_map(&mut self, address: u64, size: usize, prot: Prot) -> Result<u64, String> {
@@ -765,7 +801,7 @@ impl<'ctx> Emulator<'ctx> {
     }
 
     pub fn reg_read(&mut self, name: &str) -> Result<Vec<u8>, String> {
-        let reg = match self.sleigh.get_register(name) {
+        let reg = match self.sleigh.as_mut().unwrap().get_register(name) {
             Ok(x) => x,
             Err(_) => return Err(format!("\"{}\" is not a valid register name", name)),
         };
@@ -773,7 +809,7 @@ impl<'ctx> Emulator<'ctx> {
     }
 
     pub fn reg_write(&mut self, name: &str, dat: &[u8]) -> Result<(), String> {
-        let reg = match self.sleigh.get_register(name) {
+        let reg = match self.sleigh.as_mut().unwrap().get_register(name) {
             Ok(x) => x,
             Err(_) => return Err(format!("\"{}\" is not a valid register name", name)),
         };
@@ -781,6 +817,17 @@ impl<'ctx> Emulator<'ctx> {
             .copy_from_slice(dat);
 
         Ok(())
+    }
+
+    pub fn run(&mut self, address: u64) {
+        self.pcode_emit.pcode_asms.clear();
+        let mut addr = address;
+        loop {
+            let ldecoded = self.sleigh.as_mut().unwrap().decode(addr, Some(1)).unwrap();
+            addr += ldecoded as u64;
+
+            break;
+        }
     }
 }
 
@@ -923,24 +970,28 @@ fn main() {
         execution_engine,
     };
 
-    //let emulator = Emulator::new(&codegen, &mut sleigh);
+    let mut emulator = Emulator::new();
+    emulator.mem_map(0, 0x1000, Prot::READ | Prot::EXEC).unwrap();
+    emulator.mem_write(0, &filebuf).unwrap();
+    emulator.init_sleigh(spec, Mode::MODE64);
+    emulator.run(0);
 
-    let mut emu_regs: [u8; 1024] = [0; 1024];
-    let mut emu = Emu {
-        regs: emu_regs.as_mut_ptr(),
-        emulator: 0 as *mut usize,
-    };
-    let res_func = codegen.jit_compile_pcode(0, pcode_ops).unwrap();
-    let start = Instant::now();
-    for _ in 0..10000 {
-        emu_regs = [0; 1024];
-        unsafe {
-            res_func.call(&mut emu as *mut Emu);
-        }
-    }
-    let elapsed = start.elapsed();
-    debug!("regs: {:?}", emu_regs);
-    debug!("Runtime: {:?}", elapsed);
-    debug!("Time per run {}", elapsed.as_secs_f64() / 10000 as f64);
-    debug!("Insts/sec {}", 10000 as f64 / elapsed.as_secs_f64());
+    //let mut emu_regs: [u8; 1024] = [0; 1024];
+    //let mut emu = Emu {
+    //    regs: emu_regs.as_mut_ptr(),
+    //    emulator: 0 as *mut usize,
+    //};
+    //let res_func = codegen.jit_compile_pcode(0, pcode_ops).unwrap();
+    //let start = Instant::now();
+    //for _ in 0..10000 {
+    //    emu_regs = [0; 1024];
+    //    unsafe {
+    //        res_func.call(&mut emu as *mut Emu);
+    //    }
+    //}
+    //let elapsed = start.elapsed();
+    //debug!("regs: {:?}", emu_regs);
+    //debug!("Runtime: {:?}", elapsed);
+    //debug!("Time per run {}", elapsed.as_secs_f64() / 10000 as f64);
+    //debug!("Insts/sec {}", 10000 as f64 / elapsed.as_secs_f64());
 }
