@@ -8,7 +8,8 @@ edition = "2018"
 
 [dependencies]
 clap = "2"
-sleighcraft = { path = "../sleighcraft/sleighcraft" }
+sleighcraft = { git = "https://github.com/Jumboperson/sleighcraft" }
+#sleighcraft = { path = "../sleighcraft/sleighcraft" }
 #git = "https://github.com/StarCrossPortal/sleighcraft" }
 log = { version = "0.4", features = ["std"] }
 simplelog = "^0.10.0"
