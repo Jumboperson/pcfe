@@ -21,7 +21,7 @@ use inkwell::types::IntType;
 use inkwell::values::{BasicValueEnum, CallableValue, FunctionValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
 
-const REGS_SIZE: usize = 0x400;
+const REGS_SIZE: usize = 0x3000;
 
 bitflags! {
     struct Prot: u8 {
@@ -669,8 +669,6 @@ impl<'ctx> CodeGen<'ctx> {
 struct Emulator<'ctx> {
     regs: [u8; REGS_SIZE],
     mappings: Vec<Mapping>,
-    context: Context,
-    //codegen: Option<CodeGen<'ctx>>,
     sleigh: Option<Sleigh<'ctx>>,
     pcode_emit: CollectingPcodeEmit,
     asm_emit: CollectingAssemblyEmit,
@@ -696,8 +694,6 @@ impl<'ctx> Emulator<'ctx> {
                 regs: 0 as *mut u8,
                 emulator: 0 as *mut usize,
             },
-            context: Context::create(),
-            //codegen: None,
             sleigh: None,
             pcode_emit: CollectingPcodeEmit::default(),
             asm_emit: CollectingAssemblyEmit::default(),
@@ -711,7 +707,6 @@ impl<'ctx> Emulator<'ctx> {
         let s = self as *mut _ as usize;
         let self_ = s as *mut Emulator<'ctx>;
 
-            
         let mut sleigh_builder = SleighBuilder::default();
         sleigh_builder.spec(spec);
         sleigh_builder.mode(mode);
@@ -819,14 +814,30 @@ impl<'ctx> Emulator<'ctx> {
         Ok(())
     }
 
-    pub fn run(&mut self, address: u64) {
+    pub fn run(&mut self, codegen: &CodeGen, address: u64) {
+        self.asm_emit.asms.clear();
         self.pcode_emit.pcode_asms.clear();
+
+        self.emu_obj.regs = self.regs.as_mut_ptr();
+        self.emu_obj.emulator = self as *mut Emulator as *mut usize;
         let mut addr = address;
         loop {
             let ldecoded = self.sleigh.as_mut().unwrap().decode(addr, Some(1)).unwrap();
+            let res_func = codegen.jit_compile_pcode(0, &self.pcode_emit.pcode_asms).unwrap();
             addr += ldecoded as u64;
-
+            unsafe {
+                res_func.call(&mut self.emu_obj as *mut Emu);
+            }
             break;
+        }
+    }
+
+    pub fn display_regs(&mut self) {
+        trace!("regs: {:?}", self.regs);
+        debug!("RAX: {:?}", self.reg_read("RAX").unwrap());
+        debug!("RCX: {:?}", self.reg_read("RCX").unwrap());
+        for x in self.sleigh.as_mut().unwrap().get_register_list() {
+            debug!("{} {:?}", x, self.sleigh.as_mut().unwrap().get_register(&x).unwrap());
         }
     }
 }
@@ -934,30 +945,29 @@ fn main() {
     };
     trace!("Input file: {:?}", filebuf);
 
-    debug!("Beginning sleigh builder initialization");
-    let mut sleigh_builder = SleighBuilder::default();
-    let mut loader = PlainLoadImage::from_buf(&filebuf, 0);
-    sleigh_builder.loader(&mut loader);
-    sleigh_builder.spec(spec);
-    sleigh_builder.mode(Mode::MODE64);
+    //debug!("Beginning sleigh builder initialization");
+    //let mut sleigh_builder = SleighBuilder::default();
+    //let mut loader = PlainLoadImage::from_buf(&filebuf, 0);
+    //sleigh_builder.loader(&mut loader);
+    //sleigh_builder.spec(spec);
+    //sleigh_builder.mode(Mode::MODE64);
 
-    debug!("Beginning disassembly");
-    let mut asm_emit = CollectingAssemblyEmit::default();
-    let mut pcode_emit = CollectingPcodeEmit::default();
-    sleigh_builder.asm_emit(&mut asm_emit);
-    sleigh_builder.pcode_emit(&mut pcode_emit);
-    let mut sleigh = sleigh_builder.try_build().unwrap();
+    //debug!("Beginning disassembly");
+    //let mut asm_emit = CollectingAssemblyEmit::default();
+    //let mut pcode_emit = CollectingPcodeEmit::default();
+    //sleigh_builder.asm_emit(&mut asm_emit);
+    //sleigh_builder.pcode_emit(&mut pcode_emit);
+    //let mut sleigh = sleigh_builder.try_build().unwrap();
 
-    debug!("Decoding...");
-    let ldecoded = sleigh.decode(0, Some(1)).unwrap();
-    sleigh.decode(ldecoded as u64, Some(1)).unwrap();
+    //debug!("Decoding...");
+    //let ldecoded = sleigh.decode(0, Some(1)).unwrap();
+    //sleigh.decode(ldecoded as u64, Some(1)).unwrap();
 
-    let reg = sleigh.get_register("RCX");
-    debug!("RCX: {:?}", reg);
+    //let reg = sleigh.get_register("RCX");
+    //debug!("RCX: {:?}", reg);
 
-    debug!("{:?}", asm_emit.asms);
+    //debug!("{:?}", asm_emit.asms);
 
-    let pcode_ops = &pcode_emit.pcode_asms;
     let context = Context::create();
     let module = context.create_module("testing");
     let execution_engine = module
@@ -971,10 +981,11 @@ fn main() {
     };
 
     let mut emulator = Emulator::new();
-    emulator.mem_map(0, 0x1000, Prot::READ | Prot::EXEC).unwrap();
-    emulator.mem_write(0, &filebuf).unwrap();
+    emulator.mem_map(0x1000, 0x1000, Prot::READ | Prot::EXEC).unwrap();
+    emulator.mem_write(0x1000, &filebuf).unwrap();
     emulator.init_sleigh(spec, Mode::MODE64);
-    emulator.run(0);
+    emulator.run(&codegen, 0x1000);
+    emulator.display_regs();
 
     //let mut emu_regs: [u8; 1024] = [0; 1024];
     //let mut emu = Emu {
