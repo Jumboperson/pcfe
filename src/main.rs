@@ -17,7 +17,7 @@ use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
-use inkwell::types::IntType;
+use inkwell::types::{BasicTypeEnum, IntType};
 use inkwell::values::{BasicValueEnum, CallableValue, FunctionValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
 
@@ -51,6 +51,15 @@ struct Emu {
     pub emulator: *mut usize,
 }
 
+impl Emu {
+    extern "C" fn read_cb(&mut self, addr: u64, size: usize) -> *mut u8 {
+        0 as *mut u8
+    }
+    extern "C" fn write_cb(&mut self, addr: u64, size: usize) -> *mut u8 {
+        0 as *mut u8
+    }
+}
+
 extern "C" fn call_print() -> bool {
     println!("fasdf");
     true
@@ -63,6 +72,8 @@ struct CodeGen<'ctx> {
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     execution_engine: ExecutionEngine<'ctx>,
+    read_cb: extern "C" fn(&mut Emu, addr: u64, size: usize) -> *mut u8,
+    write_cb: extern "C" fn(&mut Emu, addr: u64, size: usize) -> *mut u8,
 }
 
 struct FuncContext<'ctx> {
@@ -101,6 +112,15 @@ impl<'ctx> FuncContext<'ctx> {
 */
 
 impl<'ctx> CodeGen<'ctx> {
+    fn get_proc_width(&self) -> u32 {
+        // TODO: Make this dynamic at runtime
+        8
+    }
+
+    fn get_size_type(&self) -> IntType<'ctx> {
+        self.int_type_from_length(self.get_proc_width())
+    }
+
     fn int_type_from_length(&self, size: u32) -> IntType<'ctx> {
         match size {
             1 => self.context.i8_type(),
@@ -130,7 +150,32 @@ impl<'ctx> CodeGen<'ctx> {
     //    address: BasicValueEnum<'ctx>,
     //    size: BasicValueEnum<'ctx>,
     //) -> BasicValueEnum<'ctx> {
-    //
+    //    let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::Generic);
+    //    let static_func = self.read_cb as u64;
+    //    let ptr_type = i8_ptr_type
+    //        .fn_type(
+    //            &[
+    //                BasicTypeEnum::PointerType(i8_ptr_type),
+    //                BasicTypeEnum::IntType(self.context.i64_type()),
+    //                BasicTypeEnum::IntType(self.get_size_type()),
+    //            ],
+    //            false,
+    //        )
+    //        .ptr_type(AddressSpace::Generic);
+
+    //    let ptr = self.builder.build_int_to_ptr(
+    //        self.context.i64_type().const_int(static_func, false),
+    //        ptr_type,
+    //        "call_func",
+    //    );
+    //    let call = self.builder.build_call(
+    //        CallableValue::try_from(ptr).unwrap(),
+    //        &[fctx.emu_ptr, address, size],
+    //        "call_val",
+    //    );
+    //    let resp = call.try_as_basic_value().left().unwrap();
+    //    // TODO: Branch to return if this is 0, if not then deref as the requested type
+    //    resp
     //}
 
     fn varnode_read_value(
@@ -677,7 +722,10 @@ struct Emulator<'ctx> {
 
 impl<'ctx> LoadImage for Emulator<'ctx> {
     fn load_fill(&mut self, ptr: &mut [u8], addr: &Address) {
-        self.mem_read(addr.offset, ptr);
+        match self.mem_read(addr.offset, ptr) {
+            Ok(_) => {}
+            Err(_) => {}
+        };
     }
 
     fn buf_size(&mut self) -> usize {
@@ -823,7 +871,9 @@ impl<'ctx> Emulator<'ctx> {
         let mut addr = address;
         loop {
             let ldecoded = self.sleigh.as_mut().unwrap().decode(addr, Some(1)).unwrap();
-            let res_func = codegen.jit_compile_pcode(0, &self.pcode_emit.pcode_asms).unwrap();
+            let res_func = codegen
+                .jit_compile_pcode(0, &self.pcode_emit.pcode_asms)
+                .unwrap();
             addr += ldecoded as u64;
             unsafe {
                 res_func.call(&mut self.emu_obj as *mut Emu);
@@ -837,7 +887,11 @@ impl<'ctx> Emulator<'ctx> {
         debug!("RAX: {:?}", self.reg_read("RAX").unwrap());
         debug!("RCX: {:?}", self.reg_read("RCX").unwrap());
         for x in self.sleigh.as_mut().unwrap().get_register_list() {
-            debug!("{} {:?}", x, self.sleigh.as_mut().unwrap().get_register(&x).unwrap());
+            debug!(
+                "{} {:?}",
+                x,
+                self.sleigh.as_mut().unwrap().get_register(&x).unwrap()
+            );
         }
     }
 }
@@ -978,10 +1032,14 @@ fn main() {
         module,
         builder: context.create_builder(),
         execution_engine,
+        read_cb: Emu::read_cb,
+        write_cb: Emu::write_cb,
     };
 
     let mut emulator = Emulator::new();
-    emulator.mem_map(0x1000, 0x1000, Prot::READ | Prot::EXEC).unwrap();
+    emulator
+        .mem_map(0x1000, 0x1000, Prot::READ | Prot::EXEC)
+        .unwrap();
     emulator.mem_write(0x1000, &filebuf).unwrap();
     emulator.init_sleigh(spec, Mode::MODE64);
     emulator.run(&codegen, 0x1000);
