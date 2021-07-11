@@ -1,3 +1,5 @@
+#[macro_use]
+extern crate bitflags;
 extern crate clap;
 use clap::{App, Arg, SubCommand};
 use log::{debug, error, info, trace, warn};
@@ -5,10 +7,10 @@ use simplelog::*;
 use sleighcraft::ffi::PcodeOpCode;
 use sleighcraft::*;
 use std::collections::BTreeMap;
+use std::convert::TryFrom;
 use std::fs::File;
 use std::io::Read;
 use std::time::Instant;
-use std::convert::TryFrom;
 
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -16,13 +18,45 @@ use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
 use inkwell::types::IntType;
-use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, CallableValue};
+use inkwell::values::{BasicValueEnum, CallableValue, FunctionValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
 
 const REGS_SIZE: usize = 0x400;
+
+bitflags! {
+    struct Prot: u8 {
+        // No protections
+        const NONE = 0b0000;
+        // Read operations permitted
+        const READ = 0b0001;
+        // Write operations permitted
+        const WRITE = 0b0010;
+        // Execution permitted on this memory
+        const EXEC = 0b0100;
+        // The memory is considered initialized,
+        //  used for detection of reads on uninitialized memory
+        const INIT = 0b1000;
+    }
+}
+
+struct Mapping {
+    address: u64,
+    memory: Vec<u8>,
+    prot: Vec<Prot>,
+}
+
+struct Emulator<'ctx> {
+    regs: [u8; REGS_SIZE],
+    mappings: Vec<Mapping>,
+    codegen: &'ctx CodeGen<'ctx>,
+    sleigh: &'ctx mut Sleigh<'ctx>,
+    emu_obj: Emu,
+}
+
 #[repr(C)]
 struct Emu {
     pub regs: *mut u8,
+    pub emulator: *mut usize,
 }
 
 extern "C" fn call_print() -> bool {
@@ -61,6 +95,19 @@ impl<'ctx> FuncContext<'ctx> {
     }
 }
 
+/*
+                   let func_ptr: extern fn() -> bool = call_print;
+                   let static_func = func_ptr as u64;
+                   let ptr_type = self.context.bool_type().fn_type(&[], false).ptr_type(AddressSpace::Generic);
+                   let ptr = self.builder.build_int_to_ptr(
+                       self.context.i64_type().const_int(static_func, false),
+                       ptr_type,
+                       "call_func"
+                   );
+                   debug!("Putting call to {:x}", static_func);
+                   self.builder.build_call(CallableValue::try_from(ptr).unwrap(), &[], "call_val");
+*/
+
 impl<'ctx> CodeGen<'ctx> {
     fn int_type_from_length(&self, size: u32) -> IntType<'ctx> {
         match size {
@@ -84,6 +131,15 @@ impl<'ctx> CodeGen<'ctx> {
         self.builder
             .build_int_cast(sign_bit, self.context.i8_type(), "b_sign_bit")
     }
+
+    //fn read_from_ram(
+    //    &self,
+    //    fctx: &FuncContext<'ctx>,
+    //    address: BasicValueEnum<'ctx>,
+    //    size: BasicValueEnum<'ctx>,
+    //) -> BasicValueEnum<'ctx> {
+    //
+    //}
 
     fn varnode_read_value(
         &self,
@@ -165,11 +221,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         let emu_ptr = fn_val.get_first_param().unwrap().into_pointer_value();
         let regs_ptr = self.builder.build_load(emu_ptr, "regs");
-        let mut fn_ctx = FuncContext::new(
-            fn_val,
-            BasicValueEnum::PointerValue(emu_ptr),
-            regs_ptr,
-        );
+        let mut fn_ctx = FuncContext::new(fn_val, BasicValueEnum::PointerValue(emu_ptr), regs_ptr);
 
         // Create a list of basic blocks correlating to each pcode inst in the slice
         //  to allow for easier branching (internal branching)
@@ -179,7 +231,7 @@ impl<'ctx> CodeGen<'ctx> {
             ops_bb.push((op, bb));
         }
         let ret_block = self.context.append_basic_block(fn_ctx.func, "return");
-        
+
         // Make sure the entry basic block goes to the next block
         let entry_next_bb = entry_bb.get_next_basic_block();
         if let Some(nbb) = entry_next_bb {
@@ -279,16 +331,6 @@ impl<'ctx> CodeGen<'ctx> {
                     assert_eq!(outvar.size, op.vars[0].size);
                     let inp0 = self.varnode_read_value(&fn_ctx, &op.vars[0]);
                     self.varnode_write_value(&mut fn_ctx, outvar, inp0);
-                    let func_ptr: extern fn() -> bool = call_print;
-                    let static_func = func_ptr as u64;
-                    let ptr_type = self.context.bool_type().fn_type(&[], false).ptr_type(AddressSpace::Generic);
-                    let ptr = self.builder.build_int_to_ptr(
-                        self.context.i64_type().const_int(static_func, false),
-                        ptr_type,
-                        "call_func"
-                    );
-                    debug!("Putting call to {:x}", static_func);
-                    self.builder.build_call(CallableValue::try_from(ptr).unwrap(), &[], "call_val");
                 }
                 /*
                  * INT_SBORROW | INT_SCARRY
@@ -342,11 +384,7 @@ impl<'ctx> CodeGen<'ctx> {
                         _ => panic!("Unreachable"),
                     };
 
-                    self.varnode_write_value(
-                        &mut fn_ctx,
-                        outvar,
-                        BasicValueEnum::IntValue(res),
-                    );
+                    self.varnode_write_value(&mut fn_ctx, outvar, BasicValueEnum::IntValue(res));
                 }
                 PcodeOpCode::INT_CARRY => {
                     assert_eq!(op.vars.len(), 2);
@@ -391,11 +429,7 @@ impl<'ctx> CodeGen<'ctx> {
                         i8_type.const_int(1, false),
                         "res",
                     );
-                    self.varnode_write_value(
-                        &mut fn_ctx,
-                        outvar,
-                        BasicValueEnum::IntValue(res),
-                    );
+                    self.varnode_write_value(&mut fn_ctx, outvar, BasicValueEnum::IntValue(res));
                 }
                 /*
                  * All INT_xxx two value same size result operations
@@ -462,11 +496,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                         _ => panic!("Unreachable!"),
                     };
-                    self.varnode_write_value(
-                        &mut fn_ctx,
-                        outvar,
-                        BasicValueEnum::IntValue(res),
-                    );
+                    self.varnode_write_value(&mut fn_ctx, outvar, BasicValueEnum::IntValue(res));
                 }
                 PcodeOpCode::INT_ZEXT | PcodeOpCode::INT_SEXT => {
                     assert_eq!(op.vars.len(), 1);
@@ -488,11 +518,7 @@ impl<'ctx> CodeGen<'ctx> {
                         }
                         _ => panic!("Unreachable!"),
                     };
-                    self.varnode_write_value(
-                        &mut fn_ctx,
-                        outvar,
-                        BasicValueEnum::IntValue(res),
-                    );
+                    self.varnode_write_value(&mut fn_ctx, outvar, BasicValueEnum::IntValue(res));
                 }
                 PcodeOpCode::INT_2COMP | PcodeOpCode::INT_NEGATE => {
                     assert_eq!(op.vars.len(), 1);
@@ -509,11 +535,7 @@ impl<'ctx> CodeGen<'ctx> {
                         PcodeOpCode::INT_NEGATE => self.builder.build_not(inp0, "not"),
                         _ => panic!("Unreachable!"),
                     };
-                    self.varnode_write_value(
-                        &mut fn_ctx,
-                        outvar,
-                        BasicValueEnum::IntValue(res),
-                    );
+                    self.varnode_write_value(&mut fn_ctx, outvar, BasicValueEnum::IntValue(res));
                 }
                 /*
                  * All INT_xxx comparison operations
@@ -561,11 +583,7 @@ impl<'ctx> CodeGen<'ctx> {
                         i8_type.const_int(1, false),
                         "res",
                     );
-                    self.varnode_write_value(
-                        &mut fn_ctx,
-                        outvar,
-                        BasicValueEnum::IntValue(res),
-                    );
+                    self.varnode_write_value(&mut fn_ctx, outvar, BasicValueEnum::IntValue(res));
                 }
                 /*
                  * POPCOUNT nonsense
@@ -629,11 +647,7 @@ impl<'ctx> CodeGen<'ctx> {
                         t2,
                         "res",
                     );
-                    self.varnode_write_value(
-                        &mut fn_ctx,
-                        outvar,
-                        BasicValueEnum::IntValue(res),
-                    );
+                    self.varnode_write_value(&mut fn_ctx, outvar, BasicValueEnum::IntValue(res));
                 }
                 _ => {
                     error!("No handler for opcode {:?}", op.opcode);
@@ -660,6 +674,99 @@ impl<'ctx> CodeGen<'ctx> {
     }
 }
 
+impl<'ctx> Emulator<'ctx> {
+    pub fn new(codegen: &'ctx CodeGen<'ctx>, sleigh: &'ctx mut Sleigh<'ctx>) -> Self {
+        Self {
+            regs: [0; REGS_SIZE],
+            mappings: Vec::new(),
+            emu_obj: Emu {
+                regs: 0 as *mut u8,
+                emulator: 0 as *mut usize,
+            },
+            codegen: codegen,
+            sleigh: sleigh,
+        }
+    }
+
+    pub fn mem_map(&mut self, address: u64, size: usize, prot: Prot) -> Result<u64, String> {
+        for m in self.mappings.iter() {
+            let e = m.address + m.memory.len() as u64;
+            let new_e = address + size as u64;
+            if (address < e && address > m.address)
+                || (new_e < e && new_e > m.address)
+                || (m.address < new_e && m.address > address)
+                || (e < new_e && e > address)
+            {
+                return Err(format!("mapping at address 0x{:x} len 0x{:x} collides with mapping at address 0x{:x} with len 0x{:x}", address, size, m.address, e - m.address));
+            }
+        }
+        // Now that we know we don't collide with any mappings, see if we can append to another
+        // mapping
+        for m in self.mappings.iter_mut() {
+            let e = m.address + m.memory.len() as u64;
+            let new_e = address + size as u64;
+            // Prepend a mapping with the new stuff
+            if new_e == m.address {
+                m.memory.reserve(size);
+                m.prot.reserve(size);
+                for _ in 0..size {
+                    m.memory.insert(0, 0);
+                    m.prot.insert(0, prot);
+                }
+                m.address -= size as u64;
+                return Ok(m.address);
+            }
+            // Postpend a mapping with new stuff
+            if e == address {
+                m.memory.resize(m.memory.len() + size, 0);
+                m.prot.resize(m.prot.len() + size, prot);
+                return Ok(m.address);
+            }
+        }
+        let m = Mapping {
+            address: address,
+            memory: vec![0; size],
+            prot: vec![prot; size],
+        };
+        self.mappings.push(m);
+        Ok(address)
+    }
+
+    pub fn mem_write(&mut self, address: u64, dat: &[u8]) -> Result<usize, String> {
+        let ne = address + dat.len() as u64;
+        for m in self.mappings.iter_mut() {
+            let e = m.address + m.memory.len() as u64;
+            if address < e && address >= m.address && ne < e && ne >= m.address {
+                let o = (address - m.address) as usize;
+                m.memory[o..o+dat.len()].copy_from_slice(dat);
+                return Ok(dat.len());
+            }
+        }
+        Err(format!("No mapping matches the range 0x{:x}-0x{:x}", address, ne)) 
+    }
+
+    pub fn mem_read(&self, address: u64, output: &mut [u8]) -> Result<usize, String> {
+        let ne = address + output.len() as u64;
+        for m in self.mappings.iter() {
+            let e = m.address + m.memory.len() as u64;
+            if address < e && address >= m.address && ne < e && ne >= m.address {
+                let o = (address - m.address) as usize;
+                output.copy_from_slice(&m.memory[o..o+output.len()]);
+                return Ok(output.len());
+            }
+        }
+        Err(format!("No mapping matches the range 0x{:x}-0x{:x}", address, ne)) 
+    }
+
+    pub fn reg_read(&mut self, name: &str) -> Result<Vec::<u8>, String> {
+        let reg = match self.sleigh.get_register(name) {
+            Ok(x) => x,
+            Err(_) => return Err(format!("\"{}\" is not a valid register name", name)),
+        };
+        Ok(self.regs[reg.offset..reg.offset + reg.size as usize].to_vec())
+    }
+}
+
 fn process_pcode(pcode_ops: &Vec<PcodeInstruction>) {
     let context = Context::create();
     let module = context.create_module("testing");
@@ -676,6 +783,7 @@ fn process_pcode(pcode_ops: &Vec<PcodeInstruction>) {
     let mut emu_regs: [u8; 1024] = [0; 1024];
     let mut emu = Emu {
         regs: emu_regs.as_mut_ptr(),
+        emulator: 0 as *mut usize,
     };
     let res_func = codegen.jit_compile_pcode(0, pcode_ops).unwrap();
     let start = Instant::now();
@@ -810,7 +918,11 @@ fn main() {
     let mut sleigh = sleigh_builder.try_build().unwrap();
 
     debug!("Decoding...");
-    sleigh.decode(0, None).unwrap();
+    let ldecoded = sleigh.decode(0, Some(1)).unwrap();
+    sleigh.decode(ldecoded as u64, Some(1)).unwrap();
+
+    let reg = sleigh.get_register("RCX");
+    debug!("{:?}", reg);
 
     debug!("{:?}", asm_emit.asms);
 

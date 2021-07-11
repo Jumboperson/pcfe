@@ -13,3 +13,5 @@ sleighcraft = { path = "../sleighcraft/sleighcraft" }
 log = { version = "0.4", features = ["std"] }
 simplelog = "^0.10.0"
 inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm10-0"] }
+bitflags = "1.2.1"
+
