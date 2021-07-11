@@ -4,7 +4,7 @@
 
 PCFE is an attempt at creating a JIT'd Pcode emulation engine for fuzzing purposes.
 
-Currently we just JIT the provided binary file into a function and then call it 10000x to determine how fast we are.
+Currently just JIT some code from the provided binary file, call it, and display some register information.
 
 ## Todo List
 
