@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::Read;
 use std::time::Instant;
 
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
@@ -53,10 +54,32 @@ struct Emu {
 
 impl Emu {
     extern "C" fn read_cb(&mut self, addr: u64, size: usize) -> *mut u8 {
-        0 as *mut u8
+        println!("Attempting to read 0x{:x} of size 0x{:x}", addr, size);
+        let emu_ptr = self.emulator as *mut Emulator;
+        let emu = unsafe { emu_ptr.as_ref().unwrap() };
+        match emu.get_mem_ptr(addr, size, Prot::READ) {
+            Ok(x) => {
+                x
+            },
+            Err(_) => {
+                println!("Failed to get memory!");
+                0 as *mut u8
+            }
+        }
     }
     extern "C" fn write_cb(&mut self, addr: u64, size: usize) -> *mut u8 {
-        0 as *mut u8
+        println!("Attempting to write 0x{:x} of size 0x{:x}", addr, size);
+        let emu_ptr = self.emulator as *mut Emulator;
+        let emu = unsafe { emu_ptr.as_ref().unwrap() };
+        match emu.get_mem_ptr(addr, size, Prot::WRITE) {
+            Ok(x) => {
+                x
+            },
+            Err(_) => {
+                println!("Failed to get memory!");
+                0 as *mut u8
+            }
+        }
     }
 }
 
@@ -144,39 +167,58 @@ impl<'ctx> CodeGen<'ctx> {
             .build_int_cast(sign_bit, self.context.i8_type(), "b_sign_bit")
     }
 
-    //fn read_from_ram(
-    //    &self,
-    //    fctx: &FuncContext<'ctx>,
-    //    address: BasicValueEnum<'ctx>,
-    //    size: BasicValueEnum<'ctx>,
-    //) -> BasicValueEnum<'ctx> {
-    //    let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::Generic);
-    //    let static_func = self.read_cb as u64;
-    //    let ptr_type = i8_ptr_type
-    //        .fn_type(
-    //            &[
-    //                BasicTypeEnum::PointerType(i8_ptr_type),
-    //                BasicTypeEnum::IntType(self.context.i64_type()),
-    //                BasicTypeEnum::IntType(self.get_size_type()),
-    //            ],
-    //            false,
-    //        )
-    //        .ptr_type(AddressSpace::Generic);
+    fn read_from_ram(
+        &self,
+        fctx: &FuncContext<'ctx>,
+        address: BasicValueEnum<'ctx>,
+        size: u32,
+    ) -> BasicValueEnum<'ctx> {
+        let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::Generic);
+        let static_func = self.read_cb as u64;
+        let ret_type = self
+            .int_type_from_length(size)
+            .ptr_type(AddressSpace::Generic);
+        let size_type = self.get_size_type();
+        let ptr_type = ret_type
+            .fn_type(
+                &[
+                    BasicTypeEnum::PointerType(i8_ptr_type),
+                    BasicTypeEnum::IntType(self.context.i64_type()),
+                    BasicTypeEnum::IntType(size_type),
+                ],
+                false,
+            )
+            .ptr_type(AddressSpace::Generic);
 
-    //    let ptr = self.builder.build_int_to_ptr(
-    //        self.context.i64_type().const_int(static_func, false),
-    //        ptr_type,
-    //        "call_func",
-    //    );
-    //    let call = self.builder.build_call(
-    //        CallableValue::try_from(ptr).unwrap(),
-    //        &[fctx.emu_ptr, address, size],
-    //        "call_val",
-    //    );
-    //    let resp = call.try_as_basic_value().left().unwrap();
-    //    // TODO: Branch to return if this is 0, if not then deref as the requested type
-    //    resp
-    //}
+        let ptr = self.builder.build_int_to_ptr(
+            self.context.i64_type().const_int(static_func, false),
+            ptr_type,
+            "call_func",
+        );
+        let call = self.builder.build_call(
+            CallableValue::try_from(ptr).unwrap(),
+            &[
+                fctx.emu_ptr,
+                address,
+                BasicValueEnum::IntValue(size_type.const_int(size as u64, false)),
+            ],
+            "call_val",
+        );
+        // Branch to return if this is 0, if not then deref as the requested type
+        let resp = call.try_as_basic_value().left().unwrap();
+        let resp_is_null = self
+            .builder
+            .build_is_null(resp.into_pointer_value(), "is_null");
+        let valid_bb = self
+            .context
+            .insert_basic_block_after(self.builder.get_insert_block().unwrap(), "not_null");
+        let ret_bb = fctx.func.get_last_basic_block().unwrap();
+        self.builder
+            .build_conditional_branch(resp_is_null, ret_bb, valid_bb);
+        self.builder.position_at_end(valid_bb);
+        self.builder
+            .build_load(resp.into_pointer_value(), "loaded_value")
+    }
 
     fn varnode_read_value(
         &self,
@@ -200,6 +242,10 @@ impl<'ctx> CodeGen<'ctx> {
                     "reg_addr",
                 );
                 self.builder.build_load(ra, "reg_val")
+            }
+            "ram" => {
+                let addr = self.context.i64_type().const_int(node.offset as u64, false);
+                self.read_from_ram(fctx, BasicValueEnum::IntValue(addr), node.size)
             }
             "unique" => fctx.uniques[&node.offset],
             "const" => {
@@ -695,7 +741,7 @@ impl<'ctx> CodeGen<'ctx> {
             match op.opcode {
                 PcodeOpCode::BRANCH | PcodeOpCode::CALL | PcodeOpCode::CBRANCH => {}
                 _ => {
-                    let next_bb = bb.get_next_basic_block();
+                    let next_bb = self.builder.get_insert_block().unwrap().get_next_basic_block();
                     if let Some(nbb) = next_bb {
                         self.builder.build_unconditional_branch(nbb);
                     }
@@ -843,8 +889,30 @@ impl<'ctx> Emulator<'ctx> {
         ))
     }
 
+    fn get_mem_ptr(&self, address: u64, size: usize, prot: Prot) -> Result<*mut u8, ()> {
+        let ne = address + size as u64;
+        for m in self.mappings.iter() {
+            let e = m.address + m.memory.len() as u64;
+            if address < e && address >= m.address && ne < e && ne >= m.address {
+                let o = (address - m.address) as usize;
+                let o_end = o + size;
+                for p in &m.prot[o..o_end] {
+                    if *p & prot == Prot::NONE {
+                        return Err(());
+                    }
+                }
+                return Ok(m.memory[o..o + size].as_ptr() as *mut u8);
+            }
+        }
+        Err(())
+    }
+
     pub fn reg_read(&mut self, name: &str) -> Result<Vec<u8>, String> {
-        let reg = match self.sleigh.as_mut().unwrap().get_register(name) {
+        let sleigh_opt = self.sleigh.as_mut();
+        if sleigh_opt.is_none() {
+            return Err("sleigh not initialized".to_string());
+        }
+        let reg = match sleigh_opt.unwrap().get_register(name) {
             Ok(x) => x,
             Err(_) => return Err(format!("\"{}\" is not a valid register name", name)),
         };
@@ -852,7 +920,11 @@ impl<'ctx> Emulator<'ctx> {
     }
 
     pub fn reg_write(&mut self, name: &str, dat: &[u8]) -> Result<(), String> {
-        let reg = match self.sleigh.as_mut().unwrap().get_register(name) {
+        let sleigh_opt = self.sleigh.as_mut();
+        if sleigh_opt.is_none() {
+            return Err("sleigh not initialized".to_string());
+        }
+        let reg = match sleigh_opt.unwrap().get_register(name) {
             Ok(x) => x,
             Err(_) => return Err(format!("\"{}\" is not a valid register name", name)),
         };
@@ -883,16 +955,16 @@ impl<'ctx> Emulator<'ctx> {
     }
 
     pub fn display_regs(&mut self) {
-        trace!("regs: {:?}", self.regs);
-        debug!("RAX: {:?}", self.reg_read("RAX").unwrap());
-        debug!("RCX: {:?}", self.reg_read("RCX").unwrap());
-        for x in self.sleigh.as_mut().unwrap().get_register_list() {
-            debug!(
-                "{} {:?}",
-                x,
-                self.sleigh.as_mut().unwrap().get_register(&x).unwrap()
-            );
-        }
+        //trace!("regs: {:?}", self.regs);
+        info!("RAX: {:?}", self.reg_read("RAX").unwrap());
+        info!("RCX: {:?}", self.reg_read("RCX").unwrap());
+        //for x in self.sleigh.as_mut().unwrap().get_register_list() {
+        //    debug!(
+        //        "{} {:?}",
+        //        x,
+        //        self.sleigh.as_mut().unwrap().get_register(&x).unwrap()
+        //    );
+        //}
     }
 }
 
@@ -1042,6 +1114,7 @@ fn main() {
         .unwrap();
     emulator.mem_write(0x1000, &filebuf).unwrap();
     emulator.init_sleigh(spec, Mode::MODE64);
+    emulator.reg_write("RAX", &u64::to_le_bytes(1));
     emulator.run(&codegen, 0x1000);
     emulator.display_regs();
 
