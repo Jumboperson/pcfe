@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate bitflags;
 extern crate clap;
-use clap::{App, Arg, SubCommand};
+use clap::{App, Arg};
 use log::{debug, error, info, trace, warn};
 use simplelog::*;
 use sleighcraft::ffi::PcodeOpCode;
@@ -10,14 +10,11 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::Read;
-use std::time::Instant;
 
-use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
-use inkwell::targets::{InitializationConfig, Target};
 use inkwell::types::{BasicType, BasicTypeEnum, IntType};
 use inkwell::values::{BasicValueEnum, CallableValue, FunctionValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
@@ -1017,10 +1014,12 @@ impl<'ctx> Emulator<'ctx> {
         self.emu_obj.emulator = self as *mut Emulator as *mut usize;
         let mut addr = address;
         loop {
+            // TODO: check prot on memory as we read pcodes
             let ldecoded = self.sleigh.as_mut().unwrap().decode(addr, Some(1)).unwrap();
             addr += ldecoded as u64;
 
-            break; //if
+            // TODO: Exit from the block on any BRANCH_INDIRECT
+            break;
         }
 
         let res_func = codegen
@@ -1149,29 +1148,6 @@ fn main() {
     };
     trace!("Input file: {:?}", filebuf);
 
-    //debug!("Beginning sleigh builder initialization");
-    //let mut sleigh_builder = SleighBuilder::default();
-    //let mut loader = PlainLoadImage::from_buf(&filebuf, 0);
-    //sleigh_builder.loader(&mut loader);
-    //sleigh_builder.spec(spec);
-    //sleigh_builder.mode(Mode::MODE64);
-
-    //debug!("Beginning disassembly");
-    //let mut asm_emit = CollectingAssemblyEmit::default();
-    //let mut pcode_emit = CollectingPcodeEmit::default();
-    //sleigh_builder.asm_emit(&mut asm_emit);
-    //sleigh_builder.pcode_emit(&mut pcode_emit);
-    //let mut sleigh = sleigh_builder.try_build().unwrap();
-
-    //debug!("Decoding...");
-    //let ldecoded = sleigh.decode(0, Some(1)).unwrap();
-    //sleigh.decode(ldecoded as u64, Some(1)).unwrap();
-
-    //let reg = sleigh.get_register("RCX");
-    //debug!("RCX: {:?}", reg);
-
-    //debug!("{:?}", asm_emit.asms);
-
     let context = Context::create();
     let module = context.create_module("testing");
     let execution_engine = module
@@ -1204,23 +1180,4 @@ fn main() {
     let mut dat = [0; 64];
     emulator.mem_read(0x0, &mut dat).unwrap();
     debug!("{:?}", &dat);
-
-    //let mut emu_regs: [u8; 1024] = [0; 1024];
-    //let mut emu = Emu {
-    //    regs: emu_regs.as_mut_ptr(),
-    //    emulator: 0 as *mut usize,
-    //};
-    //let res_func = codegen.jit_compile_pcode(0, pcode_ops).unwrap();
-    //let start = Instant::now();
-    //for _ in 0..10000 {
-    //    emu_regs = [0; 1024];
-    //    unsafe {
-    //        res_func.call(&mut emu as *mut Emu);
-    //    }
-    //}
-    //let elapsed = start.elapsed();
-    //debug!("regs: {:?}", emu_regs);
-    //debug!("Runtime: {:?}", elapsed);
-    //debug!("Time per run {}", elapsed.as_secs_f64() / 10000 as f64);
-    //debug!("Insts/sec {}", 10000 as f64 / elapsed.as_secs_f64());
 }
