@@ -37,6 +37,15 @@ bitflags! {
     }
 }
 
+#[repr(C)]
+#[derive(Debug)]
+enum ExitReason {
+    NoReason,
+    IndirectBranch,
+    InvalidMemoryProt,
+    UnmappedMemory,
+}
+
 struct Mapping {
     address: u64,
     memory: Vec<u8>,
@@ -47,29 +56,36 @@ struct Mapping {
 struct Emu {
     pub regs: *mut u8,
     pub emulator: *mut usize,
+    pub exc_addr: u64,
+    pub inst_exc_addr: u64,
+    pub exc_reason: ExitReason,
 }
 
 impl Emu {
-    extern "C" fn read_cb(&mut self, addr: u64, size: usize) -> *mut u8 {
-        println!("Attempting to read 0x{:x} of size 0x{:x}", addr, size);
+    extern "C" fn read_cb(&mut self, inst_addr: u64, addr: u64, size: usize) -> *mut u8 {
+        //println!("Attempting to read 0x{:x} of size 0x{:x}", addr, size);
         let emu_ptr = self.emulator as *mut Emulator;
         let emu = unsafe { emu_ptr.as_ref().unwrap() };
         match emu.get_mem_ptr(addr, size, Prot::READ) {
             Ok(x) => x,
-            Err(_) => {
-                println!("Failed to get memory!");
+            Err(r) => {
+                self.exc_reason = r;
+                self.exc_addr = addr;
+                self.inst_exc_addr = inst_addr;
                 0 as *mut u8
             }
         }
     }
-    extern "C" fn write_cb(&mut self, addr: u64, size: usize) -> *mut u8 {
-        println!("Attempting to write 0x{:x} of size 0x{:x}", addr, size);
+    extern "C" fn write_cb(&mut self, inst_addr: u64, addr: u64, size: usize) -> *mut u8 {
+        //println!("Attempting to write 0x{:x} of size 0x{:x}", addr, size);
         let emu_ptr = self.emulator as *mut Emulator;
         let emu = unsafe { emu_ptr.as_ref().unwrap() };
         match emu.get_mem_ptr(addr, size, Prot::WRITE) {
             Ok(x) => x,
-            Err(_) => {
-                println!("Failed to get memory!");
+            Err(r) => {
+                self.exc_reason = r;
+                self.exc_addr = addr;
+                self.inst_exc_addr = inst_addr;
                 0 as *mut u8
             }
         }
@@ -83,8 +99,8 @@ struct CodeGen<'ctx> {
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     execution_engine: ExecutionEngine<'ctx>,
-    read_cb: extern "C" fn(&mut Emu, addr: u64, size: usize) -> *mut u8,
-    write_cb: extern "C" fn(&mut Emu, addr: u64, size: usize) -> *mut u8,
+    read_cb: extern "C" fn(&mut Emu, inst_addr: u64, addr: u64, size: usize) -> *mut u8,
+    write_cb: extern "C" fn(&mut Emu, inst_addr: u64, addr: u64, size: usize) -> *mut u8,
 }
 
 struct FuncContext<'ctx> {
@@ -92,6 +108,7 @@ struct FuncContext<'ctx> {
     uniques: BTreeMap<usize, BasicValueEnum<'ctx>>,
     emu_ptr: BasicValueEnum<'ctx>,
     regs_ptr: BasicValueEnum<'ctx>,
+    cur_addr: Address,
 }
 
 impl<'ctx> FuncContext<'ctx> {
@@ -105,6 +122,10 @@ impl<'ctx> FuncContext<'ctx> {
             uniques: BTreeMap::<usize, BasicValueEnum<'ctx>>::new(),
             emu_ptr: emu_ptr,
             regs_ptr: regs_ptr,
+            cur_addr: Address {
+                space: "ram".to_string(),
+                offset: 0,
+            },
         }
     }
 }
@@ -155,11 +176,13 @@ impl<'ctx> CodeGen<'ctx> {
             .int_type_from_length(size)
             .ptr_type(AddressSpace::Generic);
         let size_type = self.get_size_type();
+        let i64_type = self.context.i64_type();
         let ptr_type = ret_type
             .fn_type(
                 &[
                     BasicTypeEnum::PointerType(i8_ptr_type),
-                    BasicTypeEnum::IntType(self.context.i64_type()),
+                    BasicTypeEnum::IntType(i64_type),
+                    BasicTypeEnum::IntType(i64_type),
                     BasicTypeEnum::IntType(size_type),
                 ],
                 false,
@@ -167,7 +190,7 @@ impl<'ctx> CodeGen<'ctx> {
             .ptr_type(AddressSpace::Generic);
 
         let ptr = self.builder.build_int_to_ptr(
-            self.context.i64_type().const_int(static_func, false),
+            i64_type.const_int(static_func, false),
             ptr_type,
             "call_func",
         );
@@ -175,6 +198,7 @@ impl<'ctx> CodeGen<'ctx> {
             CallableValue::try_from(ptr).unwrap(),
             &[
                 fctx.emu_ptr,
+                BasicValueEnum::IntValue(i64_type.const_int(fctx.cur_addr.offset, false)),
                 address,
                 BasicValueEnum::IntValue(size_type.const_int(size as u64, false)),
             ],
@@ -228,11 +252,13 @@ impl<'ctx> CodeGen<'ctx> {
             .int_type_from_length(self.sizeof_int_type(size_val.get_type()) as u32)
             .ptr_type(AddressSpace::Generic);
         let size_type = self.get_size_type();
+        let i64_type = self.context.i64_type();
         let ptr_type = ret_type
             .fn_type(
                 &[
                     BasicTypeEnum::PointerType(i8_ptr_type),
-                    BasicTypeEnum::IntType(self.context.i64_type()),
+                    BasicTypeEnum::IntType(i64_type),
+                    BasicTypeEnum::IntType(i64_type),
                     BasicTypeEnum::IntType(size_type),
                 ],
                 false,
@@ -240,13 +266,18 @@ impl<'ctx> CodeGen<'ctx> {
             .ptr_type(AddressSpace::Generic);
 
         let ptr = self.builder.build_int_to_ptr(
-            self.context.i64_type().const_int(static_func, false),
+            i64_type.const_int(static_func, false),
             ptr_type,
             "call_func",
         );
         let call = self.builder.build_call(
             CallableValue::try_from(ptr).unwrap(),
-            &[fctx.emu_ptr, address, BasicValueEnum::IntValue(size_val)],
+            &[
+                fctx.emu_ptr,
+                BasicValueEnum::IntValue(i64_type.const_int(fctx.cur_addr.offset, false)),
+                address,
+                BasicValueEnum::IntValue(size_val),
+            ],
             "call_val",
         );
         // Branch to return if this is 0, if not then deref as the requested type
@@ -296,7 +327,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let t = self.int_type_from_length(node.size);
                 BasicValueEnum::IntValue(t.const_int(node.offset as u64, false))
             }
-            _ => panic!("Unhandled space \"{}\"", node.space),
+            _ => panic!("Unhandled read space \"{}\"", node.space),
         }
     }
 
@@ -325,7 +356,7 @@ impl<'ctx> CodeGen<'ctx> {
                 let addr = self.context.i64_type().const_int(node.offset as u64, false);
                 self.write_to_ram(fctx, BasicValueEnum::IntValue(addr), val);
             }
-            _ => panic!("Unhandled space \"{}\"", node.space),
+            _ => panic!("Unhandled write space \"{}\"", node.space),
         }
     }
 
@@ -372,6 +403,7 @@ impl<'ctx> CodeGen<'ctx> {
         let mut i = 0;
         for (op, bb) in &ops_bb {
             self.builder.position_at_end(*bb);
+            fn_ctx.cur_addr = op.addr.clone();
             debug!("{:?}", op);
             match op.opcode {
                 PcodeOpCode::STORE => {
@@ -381,6 +413,17 @@ impl<'ctx> CodeGen<'ctx> {
                     let write_to = self.varnode_read_value(&fn_ctx, &op.vars[1]);
                     let to_write = self.varnode_read_value(&fn_ctx, &op.vars[2]);
                     self.write_to_ram(&fn_ctx, write_to, to_write);
+                }
+                PcodeOpCode::LOAD => {
+                    assert_eq!(op.vars.len(), 2);
+                    // Assume space is RAM for reading
+                    let write_to = self.varnode_read_value(&fn_ctx, &op.vars[1]);
+                    let outvar = match &op.out_var {
+                        Some(o) => o,
+                        None => panic!("out_var for {:?} must not be None!", op.opcode),
+                    };
+                    let res = self.read_from_ram(&fn_ctx, write_to, outvar.size);
+                    self.varnode_write_value(&mut fn_ctx, outvar, res);
                 }
                 PcodeOpCode::BRANCH | PcodeOpCode::CALL => {
                     // Raw pcode should always have exactly one input for this
@@ -851,6 +894,9 @@ impl<'ctx> Emulator<'ctx> {
             emu_obj: Emu {
                 regs: 0 as *mut u8,
                 emulator: 0 as *mut usize,
+                exc_addr: 0,
+                inst_exc_addr: 0,
+                exc_reason: ExitReason::NoReason,
             },
             sleigh: None,
             pcode_emit: CollectingPcodeEmit::default(),
@@ -953,7 +999,7 @@ impl<'ctx> Emulator<'ctx> {
         ))
     }
 
-    fn get_mem_ptr(&self, address: u64, size: usize, prot: Prot) -> Result<*mut u8, ()> {
+    fn get_mem_ptr(&self, address: u64, size: usize, prot: Prot) -> Result<*mut u8, ExitReason> {
         let ne = address + size as u64;
         for m in self.mappings.iter() {
             let e = m.address + m.memory.len() as u64;
@@ -962,13 +1008,13 @@ impl<'ctx> Emulator<'ctx> {
                 let o_end = o + size;
                 for p in &m.prot[o..o_end] {
                     if *p & prot == Prot::NONE {
-                        return Err(());
+                        return Err(ExitReason::InvalidMemoryProt);
                     }
                 }
                 return Ok(m.memory[o..o + size].as_ptr() as *mut u8);
             }
         }
-        Err(())
+        Err(ExitReason::UnmappedMemory)
     }
 
     pub fn reg_read(&mut self, name: &str) -> Result<Vec<u8>, String> {
@@ -998,7 +1044,13 @@ impl<'ctx> Emulator<'ctx> {
         Ok(())
     }
 
-    pub fn run(&mut self, codegen: &CodeGen, address: u64) {
+    pub fn run(
+        &mut self,
+        codegen: &CodeGen,
+        address: u64,
+        run_length: Option<usize>,
+        end_addr: Option<u64>,
+    ) {
         self.asm_emit.asms.clear();
         self.pcode_emit.pcode_asms.clear();
 
@@ -1010,8 +1062,17 @@ impl<'ctx> Emulator<'ctx> {
             let ldecoded = self.sleigh.as_mut().unwrap().decode(addr, Some(1)).unwrap();
             addr += ldecoded as u64;
 
+            if let Some(x) = run_length {
+                if x <= self.asm_emit.asms.len() {
+                    break;
+                }
+            }
+            if let Some(x) = end_addr {
+                if addr == x {
+                    break;
+                }
+            }
             // TODO: Exit from the block on any BRANCH_INDIRECT
-            break;
         }
 
         let res_func = codegen
@@ -1021,6 +1082,10 @@ impl<'ctx> Emulator<'ctx> {
         unsafe {
             res_func.call(&mut self.emu_obj as *mut Emu);
         }
+
+        info!("Exit reason: {:?}", self.emu_obj.exc_reason);
+        info!("Exc addr: 0x{:x}", self.emu_obj.exc_addr);
+        info!("Exc inst addr: 0x{:x}", self.emu_obj.inst_exc_addr);
     }
 
     pub fn display_regs(&mut self) {
@@ -1167,7 +1232,7 @@ fn main() {
         .reg_write("RCX", &u64::to_le_bytes(0xff00ff00ff00ffff))
         .unwrap();
     emulator.reg_write("RAX", &u64::to_le_bytes(1)).unwrap();
-    emulator.run(&codegen, 0x1000);
+    emulator.run(&codegen, 0x1000, Some(11), None);
     emulator.display_regs();
     let mut dat = [0; 64];
     emulator.mem_read(0x0, &mut dat).unwrap();
