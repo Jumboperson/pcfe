@@ -109,19 +109,6 @@ impl<'ctx> FuncContext<'ctx> {
     }
 }
 
-/*
-                   let func_ptr: extern fn() -> bool = call_print;
-                   let static_func = func_ptr as u64;
-                   let ptr_type = self.context.bool_type().fn_type(&[], false).ptr_type(AddressSpace::Generic);
-                   let ptr = self.builder.build_int_to_ptr(
-                       self.context.i64_type().const_int(static_func, false),
-                       ptr_type,
-                       "call_func"
-                   );
-                   debug!("Putting call to {:x}", static_func);
-                   self.builder.build_call(CallableValue::try_from(ptr).unwrap(), &[], "call_val");
-*/
-
 impl<'ctx> CodeGen<'ctx> {
     fn get_native_proc_width(&self) -> u32 {
         // TODO: Make this dynamic based on compilation arch
