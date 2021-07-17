@@ -123,13 +123,14 @@ impl<'ctx> FuncContext<'ctx> {
 */
 
 impl<'ctx> CodeGen<'ctx> {
-    fn get_proc_width(&self) -> u32 {
-        // TODO: Make this dynamic at runtime
+    fn get_native_proc_width(&self) -> u32 {
+        // TODO: Make this dynamic based on compilation arch
+        //  8 for 64 bit, 4 for 32 bit
         8
     }
 
     fn get_size_type(&self) -> IntType<'ctx> {
-        self.int_type_from_length(self.get_proc_width())
+        self.int_type_from_length(self.get_native_proc_width())
     }
 
     fn int_type_from_length(&self, size: u32) -> IntType<'ctx> {
