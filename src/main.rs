@@ -18,7 +18,7 @@ use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
 use inkwell::targets::{InitializationConfig, Target};
-use inkwell::types::{BasicTypeEnum, IntType};
+use inkwell::types::{BasicType, BasicTypeEnum, IntType};
 use inkwell::values::{BasicValueEnum, CallableValue, FunctionValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
 
@@ -58,9 +58,7 @@ impl Emu {
         let emu_ptr = self.emulator as *mut Emulator;
         let emu = unsafe { emu_ptr.as_ref().unwrap() };
         match emu.get_mem_ptr(addr, size, Prot::READ) {
-            Ok(x) => {
-                x
-            },
+            Ok(x) => x,
             Err(_) => {
                 println!("Failed to get memory!");
                 0 as *mut u8
@@ -72,20 +70,13 @@ impl Emu {
         let emu_ptr = self.emulator as *mut Emulator;
         let emu = unsafe { emu_ptr.as_ref().unwrap() };
         match emu.get_mem_ptr(addr, size, Prot::WRITE) {
-            Ok(x) => {
-                x
-            },
+            Ok(x) => x,
             Err(_) => {
                 println!("Failed to get memory!");
                 0 as *mut u8
             }
         }
     }
-}
-
-extern "C" fn call_print() -> bool {
-    println!("fasdf");
-    true
 }
 
 type EmuFunc = unsafe extern "C" fn(*mut Emu);
@@ -220,6 +211,74 @@ impl<'ctx> CodeGen<'ctx> {
             .build_load(resp.into_pointer_value(), "loaded_value")
     }
 
+    fn sizeof_int_type(&self, itype: IntType) -> u32 {
+        let byte_type = self.int_type_from_length(1);
+        let word_type = self.int_type_from_length(2);
+        let dword_type = self.int_type_from_length(4);
+        let qword_type = self.int_type_from_length(8);
+        if itype == byte_type {
+            1
+        } else if itype == word_type {
+            2
+        } else if itype == dword_type {
+            4
+        } else if itype == qword_type {
+            8
+        } else {
+            error!("Invalid int type {:?}", itype);
+            panic!("Invalid int type!");
+        }
+    }
+
+    fn write_to_ram(
+        &self,
+        fctx: &FuncContext<'ctx>,
+        address: BasicValueEnum<'ctx>,
+        value: BasicValueEnum<'ctx>,
+    ) {
+        let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::Generic);
+        let static_func = self.write_cb as u64;
+        let size_val = value.get_type().size_of().unwrap();
+        let ret_type = self
+            .int_type_from_length(self.sizeof_int_type(size_val.get_type()) as u32)
+            .ptr_type(AddressSpace::Generic);
+        let size_type = self.get_size_type();
+        let ptr_type = ret_type
+            .fn_type(
+                &[
+                    BasicTypeEnum::PointerType(i8_ptr_type),
+                    BasicTypeEnum::IntType(self.context.i64_type()),
+                    BasicTypeEnum::IntType(size_type),
+                ],
+                false,
+            )
+            .ptr_type(AddressSpace::Generic);
+
+        let ptr = self.builder.build_int_to_ptr(
+            self.context.i64_type().const_int(static_func, false),
+            ptr_type,
+            "call_func",
+        );
+        let call = self.builder.build_call(
+            CallableValue::try_from(ptr).unwrap(),
+            &[fctx.emu_ptr, address, BasicValueEnum::IntValue(size_val)],
+            "call_val",
+        );
+        // Branch to return if this is 0, if not then deref as the requested type
+        let resp = call.try_as_basic_value().left().unwrap();
+        let resp_is_null = self
+            .builder
+            .build_is_null(resp.into_pointer_value(), "is_null");
+        let valid_bb = self
+            .context
+            .insert_basic_block_after(self.builder.get_insert_block().unwrap(), "not_null");
+        let ret_bb = fctx.func.get_last_basic_block().unwrap();
+        self.builder
+            .build_conditional_branch(resp_is_null, ret_bb, valid_bb);
+        self.builder.position_at_end(valid_bb);
+        self.builder.build_store(resp.into_pointer_value(), value);
+    }
+
     fn varnode_read_value(
         &self,
         fctx: &FuncContext<'ctx>,
@@ -277,6 +336,10 @@ impl<'ctx> CodeGen<'ctx> {
             "unique" => {
                 fctx.uniques.insert(node.offset, val);
             }
+            "ram" => {
+                let addr = self.context.i64_type().const_int(node.offset as u64, false);
+                self.write_to_ram(fctx, BasicValueEnum::IntValue(addr), val);
+            }
             _ => panic!("Unhandled space \"{}\"", node.space),
         }
     }
@@ -326,6 +389,14 @@ impl<'ctx> CodeGen<'ctx> {
             self.builder.position_at_end(*bb);
             debug!("{:?}", op);
             match op.opcode {
+                PcodeOpCode::STORE => {
+                    assert_eq!(op.vars.len(), 3);
+                    assert!(op.out_var.is_none());
+                    // Assume space is RAM for writing
+                    let write_to = self.varnode_read_value(&fn_ctx, &op.vars[1]);
+                    let to_write = self.varnode_read_value(&fn_ctx, &op.vars[2]);
+                    self.write_to_ram(&fn_ctx, write_to, to_write);
+                }
                 PcodeOpCode::BRANCH | PcodeOpCode::CALL => {
                     // Raw pcode should always have exactly one input for this
                     assert_eq!(op.vars.len(), 1);
@@ -741,7 +812,11 @@ impl<'ctx> CodeGen<'ctx> {
             match op.opcode {
                 PcodeOpCode::BRANCH | PcodeOpCode::CALL | PcodeOpCode::CBRANCH => {}
                 _ => {
-                    let next_bb = self.builder.get_insert_block().unwrap().get_next_basic_block();
+                    let next_bb = self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_next_basic_block();
                     if let Some(nbb) = next_bb {
                         self.builder.build_unconditional_branch(nbb);
                     }
@@ -943,14 +1018,17 @@ impl<'ctx> Emulator<'ctx> {
         let mut addr = address;
         loop {
             let ldecoded = self.sleigh.as_mut().unwrap().decode(addr, Some(1)).unwrap();
-            let res_func = codegen
-                .jit_compile_pcode(0, &self.pcode_emit.pcode_asms)
-                .unwrap();
             addr += ldecoded as u64;
-            unsafe {
-                res_func.call(&mut self.emu_obj as *mut Emu);
-            }
-            break;
+
+            break; //if
+        }
+
+        let res_func = codegen
+            .jit_compile_pcode(address, &self.pcode_emit.pcode_asms)
+            .unwrap();
+
+        unsafe {
+            res_func.call(&mut self.emu_obj as *mut Emu);
         }
     }
 
@@ -1112,11 +1190,20 @@ fn main() {
     emulator
         .mem_map(0x1000, 0x1000, Prot::READ | Prot::EXEC)
         .unwrap();
+    emulator
+        .mem_map(0, 0x100, Prot::WRITE | Prot::READ)
+        .unwrap();
     emulator.mem_write(0x1000, &filebuf).unwrap();
     emulator.init_sleigh(spec, Mode::MODE64);
-    emulator.reg_write("RAX", &u64::to_le_bytes(1));
+    emulator
+        .reg_write("RCX", &u64::to_le_bytes(0xff00ff00ff00ffff))
+        .unwrap();
+    emulator.reg_write("RAX", &u64::to_le_bytes(1)).unwrap();
     emulator.run(&codegen, 0x1000);
     emulator.display_regs();
+    let mut dat = [0; 64];
+    emulator.mem_read(0x0, &mut dat).unwrap();
+    debug!("{:?}", &dat);
 
     //let mut emu_regs: [u8; 1024] = [0; 1024];
     //let mut emu = Emu {
