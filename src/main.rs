@@ -409,6 +409,8 @@ impl<'ctx> CodeGen<'ctx> {
                                     break;
                                 }
                             }
+                            // TODO: Add a thing here to return with an exit reason indicating
+                            //  a branch
                             if !found {
                                 panic!("Unimplemented branching outside of known space");
                             }
@@ -454,6 +456,8 @@ impl<'ctx> CodeGen<'ctx> {
                                     break;
                                 }
                             }
+                            // TODO: Add a thing here to return with an exit reason indicating
+                            //  a branch
                             if !found {
                                 panic!("Unimplemented branching outside of known space");
                             }
