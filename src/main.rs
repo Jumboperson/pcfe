@@ -90,6 +90,11 @@ impl Emu {
             }
         }
     }
+    extern "C" fn indirect_branch(&mut self, addr: u64, from_addr: u64) {
+        self.exc_reason = ExitReason::IndirectBranch;
+        self.exc_addr = addr;
+        self.inst_exc_addr = from_addr;
+    }
 }
 
 type EmuFunc = unsafe extern "C" fn(*mut Emu);
@@ -101,6 +106,7 @@ struct CodeGen<'ctx> {
     execution_engine: ExecutionEngine<'ctx>,
     read_cb: extern "C" fn(&mut Emu, inst_addr: u64, addr: u64, size: usize) -> *mut u8,
     write_cb: extern "C" fn(&mut Emu, inst_addr: u64, addr: u64, size: usize) -> *mut u8,
+    indirect_branch: extern "C" fn(&mut Emu, addr: u64, from_addr: u64),
 }
 
 struct FuncContext<'ctx> {
@@ -162,6 +168,62 @@ impl<'ctx> CodeGen<'ctx> {
         );
         self.builder
             .build_int_cast(sign_bit, self.context.i8_type(), "b_sign_bit")
+    }
+
+    fn branch_unknown(
+        &self,
+        fctx: &FuncContext<'ctx>,
+        location: IntValue<'ctx>,
+        condition: Option<IntValue<'ctx>>,
+    ) {
+        if let Some(cond) = condition {
+            let next_bb = self
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_next_basic_block()
+                .unwrap();
+            let branch_bb = self
+                .context
+                .insert_basic_block_after(self.builder.get_insert_block().unwrap(), "do_branch");
+            self.builder
+                .build_conditional_branch(cond, branch_bb, next_bb);
+            self.builder.position_at_end(branch_bb);
+        }
+        let ret_bb = fctx.func.get_last_basic_block().unwrap();
+
+        let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::Generic);
+        let static_func = self.indirect_branch as u64;
+        let ret_type = self.context.void_type();
+        let size_type = self.get_size_type();
+        let i64_type = self.context.i64_type();
+        let ptr_type = ret_type
+            .fn_type(
+                &[
+                    BasicTypeEnum::PointerType(i8_ptr_type),
+                    BasicTypeEnum::IntType(i64_type),
+                    BasicTypeEnum::IntType(i64_type),
+                ],
+                false,
+            )
+            .ptr_type(AddressSpace::Generic);
+
+        let ptr = self.builder.build_int_to_ptr(
+            i64_type.const_int(static_func, false),
+            ptr_type,
+            "call_func",
+        );
+        self.builder.build_call(
+            CallableValue::try_from(ptr).unwrap(),
+            &[
+                fctx.emu_ptr,
+                BasicValueEnum::IntValue(location),
+                BasicValueEnum::IntValue(i64_type.const_int(fctx.cur_addr.offset, false)),
+            ],
+            "call_val",
+        );
+
+        self.builder.build_unconditional_branch(ret_bb);
     }
 
     fn read_from_ram(
@@ -452,10 +514,13 @@ impl<'ctx> CodeGen<'ctx> {
                                     break;
                                 }
                             }
-                            // TODO: Add a thing here to return with an exit reason indicating
-                            //  a branch
+
                             if !found {
-                                panic!("Unimplemented branching outside of known space");
+                                self.branch_unknown(
+                                    &fn_ctx,
+                                    self.context.i64_type().const_int(inp0.offset as u64, false),
+                                    None,
+                                );
                             }
                         }
                         _ => panic!("Unimplemented branch for space \"{}\"", inp0.space),
@@ -499,10 +564,13 @@ impl<'ctx> CodeGen<'ctx> {
                                     break;
                                 }
                             }
-                            // TODO: Add a thing here to return with an exit reason indicating
-                            //  a branch
+
                             if !found {
-                                panic!("Unimplemented branching outside of known space");
+                                self.branch_unknown(
+                                    &fn_ctx,
+                                    self.context.i64_type().const_int(inp0.offset as u64, false),
+                                    Some(inp1),
+                                );
                             }
                         }
                         _ => panic!("Unimplemented cbranch for space \"{}\"", inp0.space),
@@ -1082,6 +1150,7 @@ impl<'ctx> Emulator<'ctx> {
         unsafe {
             res_func.call(&mut self.emu_obj as *mut Emu);
         }
+        // TODO: on IndirectBranch exit we should loop back around and keep going
 
         info!("Exit reason: {:?}", self.emu_obj.exc_reason);
         info!("Exc addr: 0x{:x}", self.emu_obj.exc_addr);
@@ -1217,6 +1286,7 @@ fn main() {
         execution_engine,
         read_cb: Emu::read_cb,
         write_cb: Emu::write_cb,
+        indirect_branch: Emu::indirect_branch,
     };
 
     let mut emulator = Emulator::new();

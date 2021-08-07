@@ -8,9 +8,7 @@ Currently just JIT some code from the provided binary file, call it, and display
 
 ## Todo List
 
-* Update instruction pointer
-* Add RAM access
-  * May need to modify Sleighcraft for this
+* Add big endian support
 * Fix the weird bug with branching + optimizations
 * Breakpoints
 * Coverage callbacks
