@@ -38,7 +38,7 @@ bitflags! {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum ExitReason {
     NoReason,
     IndirectBranch,
@@ -46,6 +46,7 @@ enum ExitReason {
     UnmappedMemory,
 }
 
+#[derive(Clone, Debug)]
 struct Mapping {
     address: u64,
     memory: Vec<u8>,
@@ -195,7 +196,6 @@ impl<'ctx> CodeGen<'ctx> {
         let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::Generic);
         let static_func = self.indirect_branch as u64;
         let ret_type = self.context.void_type();
-        let size_type = self.get_size_type();
         let i64_type = self.context.i64_type();
         let ptr_type = ret_type
             .fn_type(
@@ -938,6 +938,7 @@ struct Emulator<'ctx> {
     sleigh: Option<Sleigh<'ctx>>,
     pcode_emit: CollectingPcodeEmit,
     asm_emit: CollectingAssemblyEmit,
+    cache: BTreeMap<u64, (JitFunction<'ctx, EmuFunc>, usize)>,
     emu_obj: Emu,
 }
 
@@ -969,6 +970,7 @@ impl<'ctx> Emulator<'ctx> {
             sleigh: None,
             pcode_emit: CollectingPcodeEmit::default(),
             asm_emit: CollectingAssemblyEmit::default(),
+            cache: BTreeMap::new(),
         }
     }
 
@@ -1114,41 +1116,48 @@ impl<'ctx> Emulator<'ctx> {
 
     pub fn run(
         &mut self,
-        codegen: &CodeGen,
+        codegen: &'ctx CodeGen,
         address: u64,
-        run_length: Option<usize>,
         end_addr: Option<u64>,
     ) {
-        self.asm_emit.asms.clear();
-        self.pcode_emit.pcode_asms.clear();
-
         self.emu_obj.regs = self.regs.as_mut_ptr();
         self.emu_obj.emulator = self as *mut Emulator as *mut usize;
+
         let mut addr = address;
         loop {
-            // TODO: check prot on memory as we read pcodes
-            let ldecoded = self.sleigh.as_mut().unwrap().decode(addr, Some(1)).unwrap();
-            addr += ldecoded as u64;
+            let res_func = if let Some(f) = self.cache.get(&addr) {
+                f
+            } else {
+                self.asm_emit.asms.clear();
+                self.pcode_emit.pcode_asms.clear();
 
-            if let Some(x) = run_length {
-                if x <= self.asm_emit.asms.len() {
-                    break;
+                loop {
+                    // TODO: Check mem prot on this decode
+                    let ldecoded = self.sleigh.as_mut().unwrap().decode(addr, Some(1)).unwrap();
+                    addr += ldecoded as u64;
+
+                    if let Some(x) = end_addr {
+                        if addr == x {
+                            break;
+                        }
+                    }
                 }
-            }
-            if let Some(x) = end_addr {
-                if addr == x {
-                    break;
-                }
-            }
-            // TODO: Exit from the block on any BRANCH_INDIRECT
-        }
 
-        let res_func = codegen
-            .jit_compile_pcode(address, &self.pcode_emit.pcode_asms)
-            .unwrap();
+                self.cache.insert(addr, (codegen
+                    .jit_compile_pcode(address, &self.pcode_emit.pcode_asms)
+                    .unwrap(), self.asm_emit.asms.len()));
+                self.cache.get(&addr).unwrap()
+            };
 
-        unsafe {
-            res_func.call(&mut self.emu_obj as *mut Emu);
+            self.emu_obj.exc_reason = ExitReason::NoReason;
+            unsafe {
+                res_func.0.call(&mut self.emu_obj as *mut Emu);
+            }
+            if self.emu_obj.exc_reason == ExitReason::IndirectBranch {
+                addr = self.emu_obj.exc_addr;
+            } else {
+                break;
+            }
         }
         // TODO: on IndirectBranch exit we should loop back around and keep going
 
@@ -1302,7 +1311,7 @@ fn main() {
         .reg_write("RCX", &u64::to_le_bytes(0xff00ff00ff00ffff))
         .unwrap();
     emulator.reg_write("RAX", &u64::to_le_bytes(1)).unwrap();
-    emulator.run(&codegen, 0x1000, Some(11), None);
+    emulator.run(&codegen, 0x1000, Some(0x1008));
     emulator.display_regs();
     let mut dat = [0; 64];
     emulator.mem_read(0x0, &mut dat).unwrap();
